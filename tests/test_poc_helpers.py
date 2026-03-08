@@ -38,6 +38,19 @@ class PrototypeDistanceTests(unittest.TestCase):
         self.assertTrue(np.all(out >= 0))
 
 
+
+    def test_chunked_min_distance_mahalanobis_diag_shape(self) -> None:
+        cfg = self.PoCConfig(distance_type="mahalanobis_diag")
+        model = self.PrototypeAnomalyModel(cfg)
+        x = np.random.randn(11, 6).astype(np.float32)
+        means = np.random.randn(4, 6).astype(np.float32)
+        vars_ = np.abs(np.random.randn(4, 6).astype(np.float32)) + 1e-3
+        model.mahalanobis_means = means
+        model.mahalanobis_vars = vars_
+        out = model._chunked_min_distance(x, means, chunk_size=5)
+        self.assertEqual(out.shape, (11,))
+        self.assertTrue(np.all(np.isfinite(out)))
+
     def test_resolve_num_clusters_caps_at_samples(self) -> None:
         cfg = self.PoCConfig()
         model = self.PrototypeAnomalyModel(cfg)

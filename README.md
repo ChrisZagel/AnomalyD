@@ -52,7 +52,8 @@ Folgende Namen werden explizit unterstützt:
 - `--feature-size-factor` (z. B. `1.0`, `0.75`, `0.5`)
 - `--num-prototypes` (z. B. `256`)
 - `--pca-dim` (z. B. `128`)
-- `--distance-type` (`cosine` oder `l2`)
+- `--distance-type` (`cosine`, `l2`, `mahalanobis_diag`)
+- `--mahalanobis-alpha`, `--mahalanobis-min-var`, `--mahalanobis-eps` (nur für `mahalanobis_diag`)
 - `--num-visualization-examples` (Default `5`)
 
 ---
@@ -78,3 +79,8 @@ ADPretrain-Checkpoint-Support wurde entfernt; der PoC arbeitet jetzt ausschließ
 ## Stabilität bei kleiner Feature-Map
 
 Wenn ein Backbone eine sehr grobe Feature-Map liefert (z. B. wenige Patch-Features pro Bild), wird die effektive Anzahl der Prototypen automatisch auf die verfügbare Anzahl reduzierter Trainings-Patches begrenzt. Dadurch wird der Fehler `n_samples < n_clusters` vermieden.
+
+
+## Mahalanobis (diag) Distanz
+
+Bei `--distance-type mahalanobis_diag` werden nach PCA+KMeans pro Prototyp diagonale Varianzen aus den PCA-Trainingsfeatures geschätzt (mit globaler Varianz-Regularisierung und Mindestvarianz-Clipping). Die zusätzlichen Statistikparameter werden mit dem Modell gespeichert.

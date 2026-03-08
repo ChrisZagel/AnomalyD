@@ -52,6 +52,9 @@ class PoCConfig:
     num_prototypes: int = 256
     pca_dim: int = 128
     distance_type: str = "cosine"
+    mahalanobis_alpha: float = 0.7
+    mahalanobis_min_var: float = 1e-6
+    mahalanobis_eps: float = 1e-12
     topk_percent: float = 1.0
     batch_size: int = 4
     num_workers: int = 2
@@ -217,12 +220,59 @@ class PrototypeAnomalyModel:
         self.cfg = cfg
         self.pca: PCA | None = None
         self.centers: np.ndarray | None = None
+        self.mahalanobis_means: np.ndarray | None = None
+        self.mahalanobis_vars: np.ndarray | None = None
+        self.mahalanobis_global_var: np.ndarray | None = None
 
     @staticmethod
     def _resolve_num_clusters(requested: int, n_samples: int) -> int:
         if n_samples <= 0:
             raise ValueError("No training samples available for clustering.")
         return max(1, min(requested, n_samples))
+
+    @staticmethod
+    def _chunked_assign_to_centers(x: np.ndarray, centers: np.ndarray, chunk_size: int = 8192) -> np.ndarray:
+        assigns: list[np.ndarray] = []
+        c2 = np.sum(centers**2, axis=1)[None, :]
+        for i in range(0, x.shape[0], chunk_size):
+            chunk = x[i : i + chunk_size]
+            d2 = np.sum(chunk**2, axis=1, keepdims=True) + c2 - 2.0 * chunk @ centers.T
+            assigns.append(np.argmin(d2, axis=1).astype(np.int64))
+        return np.concatenate(assigns, axis=0)
+
+    def _fit_mahalanobis_diag_stats(self, train_feats_red: np.ndarray, kmeans_centers: np.ndarray) -> None:
+        assigns = self._chunked_assign_to_centers(train_feats_red, kmeans_centers)
+        n_clusters = kmeans_centers.shape[0]
+        dim = train_feats_red.shape[1]
+
+        counts = np.bincount(assigns, minlength=n_clusters).astype(np.float64)
+        sums = np.zeros((n_clusters, dim), dtype=np.float64)
+        sums_sq = np.zeros((n_clusters, dim), dtype=np.float64)
+
+        np.add.at(sums, assigns, train_feats_red)
+        np.add.at(sums_sq, assigns, train_feats_red * train_feats_red)
+
+        global_var = np.var(train_feats_red, axis=0).astype(np.float32)
+        means = kmeans_centers.astype(np.float32).copy()
+        local_var = np.zeros((n_clusters, dim), dtype=np.float32)
+
+        non_empty = counts > 0
+        if np.any(non_empty):
+            means[non_empty] = (sums[non_empty] / counts[non_empty, None]).astype(np.float32)
+            ex2 = sums_sq[non_empty] / counts[non_empty, None]
+            var = ex2 - np.square(means[non_empty], dtype=np.float64)
+            local_var[non_empty] = np.clip(var, a_min=0.0, a_max=None).astype(np.float32)
+
+        if np.any(~non_empty):
+            local_var[~non_empty] = global_var
+
+        alpha = float(self.cfg.mahalanobis_alpha)
+        reg_var = alpha * local_var + (1.0 - alpha) * global_var[None, :]
+        reg_var = np.clip(reg_var, a_min=float(self.cfg.mahalanobis_min_var), a_max=None).astype(np.float32)
+
+        self.mahalanobis_means = means
+        self.mahalanobis_vars = reg_var
+        self.mahalanobis_global_var = global_var
 
     def fit(self, dataset: MVTecMetalNutDataset, extractor: FeatureExtractor) -> None:
         pca_samples = []
@@ -264,6 +314,9 @@ class PrototypeAnomalyModel:
 
         self.centers = kmeans.cluster_centers_.astype(np.float32)
 
+        if self.cfg.distance_type == "mahalanobis_diag":
+            self._fit_mahalanobis_diag_stats(all_train_red.astype(np.float32), self.centers)
+
     def save(self, output_dir: Path) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
         if self.pca is None or self.centers is None:
@@ -275,6 +328,9 @@ class PrototypeAnomalyModel:
             "config": asdict(self.cfg),
             "pca": self.pca,
             "centers": self.centers,
+            "mahalanobis_means": self.mahalanobis_means,
+            "mahalanobis_vars": self.mahalanobis_vars,
+            "mahalanobis_global_var": self.mahalanobis_global_var,
         }
         with open(output_dir / "prototype_model.pkl", "wb") as f:
             pickle.dump(payload, f)
@@ -297,6 +353,17 @@ class PrototypeAnomalyModel:
                     - 2.0 * chunk @ centers.T
                 )
                 mins.append(np.sqrt(np.clip(np.min(d2, axis=1), a_min=0.0, a_max=None)))
+        elif self.cfg.distance_type == "mahalanobis_diag":
+            if self.mahalanobis_means is None or self.mahalanobis_vars is None:
+                raise RuntimeError("Mahalanobis statistics are not available. Fit model with distance_type='mahalanobis_diag'.")
+            means = self.mahalanobis_means
+            vars_ = self.mahalanobis_vars
+            eps = float(self.cfg.mahalanobis_eps)
+            for i in range(0, x.shape[0], chunk_size):
+                chunk = x[i : i + chunk_size]
+                diff = chunk[:, None, :] - means[None, :, :]
+                d2 = np.sum((diff * diff) / (vars_[None, :, :] + eps), axis=2)
+                mins.append(np.min(d2, axis=1))
         else:
             raise ValueError(f"Unsupported distance_type: {self.cfg.distance_type}")
         return np.concatenate(mins, axis=0)
@@ -821,7 +888,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-size-factor", type=float, default=0.75)
     parser.add_argument("--num-prototypes", type=int, default=256)
     parser.add_argument("--pca-dim", type=int, default=128)
-    parser.add_argument("--distance-type", type=str, default="cosine", choices=["cosine", "l2"])
+    parser.add_argument("--distance-type", type=str, default="cosine", choices=["cosine", "l2", "mahalanobis_diag"])
     parser.add_argument(
         "--backbone-model-name",
         type=str,
@@ -835,6 +902,9 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="How many final false-color overlay examples to save.",
     )
+    parser.add_argument("--mahalanobis-alpha", type=float, default=0.7)
+    parser.add_argument("--mahalanobis-min-var", type=float, default=1e-6)
+    parser.add_argument("--mahalanobis-eps", type=float, default=1e-12)
     return parser.parse_args()
 
 
@@ -847,6 +917,9 @@ def main() -> None:
         pca_dim=args.pca_dim,
         distance_type=args.distance_type,
         num_visualization_examples=args.num_visualization_examples,
+        mahalanobis_alpha=args.mahalanobis_alpha,
+        mahalanobis_min_var=args.mahalanobis_min_var,
+        mahalanobis_eps=args.mahalanobis_eps,
     )
     run_poc(cfg)
 
