@@ -743,13 +743,14 @@ def evaluate(
     extractor: FeatureExtractor,
     proto_model: PrototypeAnomalyModel,
     out_dir: Path,
-) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]], dict[int, np.ndarray]]:
     image_labels: list[int] = []
     image_scores: list[float] = []
     pixel_labels: list[np.ndarray] = []
     pixel_scores: list[np.ndarray] = []
     per_sample_rows: list[dict[str, Any]] = []
     per_sample_eval: list[dict[str, Any]] = []
+    anom_maps_by_index: dict[int, np.ndarray] = {}
 
     vis_dir = out_dir / "visualizations"
     vis_dir.mkdir(parents=True, exist_ok=True)
@@ -793,6 +794,7 @@ def evaluate(
                     "anom_map": anom_map.astype(np.float32),
                 }
             )
+            anom_maps_by_index[sample_idx] = anom_map.astype(np.float32)
 
             if saved_vis < 8:
                 save_visualization(sample, anom_map, vis_dir / f"sample_{sample_idx:03d}.png")
@@ -808,7 +810,7 @@ def evaluate(
         "mean_infer_time_sec": float(np.mean([r["infer_time_sec"] for r in per_sample_rows])),
         "std_infer_time_sec": float(np.std([r["infer_time_sec"] for r in per_sample_rows])),
     }
-    return metrics, per_sample_rows, per_sample_eval
+    return metrics, per_sample_rows, per_sample_eval, anom_maps_by_index
 
 
 def save_per_sample_report(rows: list[dict[str, Any]], out_dir: Path) -> None:
@@ -960,10 +962,11 @@ def save_per_defect_metrics(rows: list[dict[str, Any]], out_dir: Path) -> None:
 def save_overlay_gallery(
     rows: list[dict[str, Any]],
     test_ds: MVTecMetalNutDataset,
-    extractor: FeatureExtractor,
-    proto_model: PrototypeAnomalyModel,
+    extractor: FeatureExtractor | None,
+    proto_model: PrototypeAnomalyModel | None,
     out_path: Path,
     num_examples: int,
+    anom_maps_by_index: dict[int, np.ndarray] | None = None,
 ) -> None:
     if not rows or num_examples <= 0:
         return
@@ -976,7 +979,12 @@ def save_overlay_gallery(
 
     for ax, row in zip(axes, top_rows):
         sample = test_ds[int(row["index"])]
-        anom_map, _ = proto_model.infer_map(sample["image"], extractor, sample["orig_size"])
+        index = int(row["index"])
+        anom_map = None if anom_maps_by_index is None else anom_maps_by_index.get(index)
+        if anom_map is None:
+            if proto_model is None or extractor is None:
+                raise ValueError("Missing anomaly map and fallback inference dependencies for overlay gallery.")
+            anom_map, _ = proto_model.infer_map(sample["image"], extractor, sample["orig_size"])
         image_np = np.array(sample["image"]) / 255.0
         norm = (anom_map - anom_map.min()) / (anom_map.max() - anom_map.min() + 1e-8)
         heat = plt.cm.jet(norm)[..., :3]
@@ -1057,7 +1065,7 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
     proto_model.save(output_dir / "models")
 
     t_eval = time.perf_counter()
-    metrics, per_sample_rows, per_sample_eval = evaluate(test_ds, extractor, proto_model, output_dir)
+    metrics, per_sample_rows, per_sample_eval, anom_maps_by_index = evaluate(test_ds, extractor, proto_model, output_dir)
     eval_time = time.perf_counter() - t_eval
     total_time = time.perf_counter() - t_all
 
@@ -1102,6 +1110,7 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
         proto_model,
         gallery_path,
         num_examples=cfg.num_visualization_examples,
+        anom_maps_by_index=anom_maps_by_index,
     )
 
     print("Final metrics:")
