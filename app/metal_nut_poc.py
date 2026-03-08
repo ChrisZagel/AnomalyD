@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import random
+import shutil
 import tarfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -311,7 +312,9 @@ def _normalize_dataset_layout(extract_root: Path, category: str) -> Path:
         nested_dir = nested[0]
         category_dir.parent.mkdir(parents=True, exist_ok=True)
         if nested_dir.resolve() != category_dir.resolve():
-            nested_dir.replace(category_dir)
+            if category_dir.exists():
+                shutil.rmtree(category_dir)
+            shutil.move(str(nested_dir), str(category_dir))
         return category_dir
 
     raise FileNotFoundError(f"Could not locate extracted category directory for {category} under {extract_root}")
@@ -335,6 +338,10 @@ def ensure_dataset(cfg: PoCConfig) -> Path:
 
     print(f"Extracting {archive_path} ...")
     with tarfile.open(archive_path, mode="r:xz") as tar:
+        for member in tar.getmembers():
+            member_path = extract_root / member.name
+            if not member_path.resolve().is_relative_to(extract_root.resolve()):
+                raise RuntimeError(f"Unsafe archive entry blocked: {member.name}")
         tar.extractall(path=extract_root)
 
     target_root = _normalize_dataset_layout(extract_root, cfg.category)
@@ -378,6 +385,19 @@ def load_backbone(cfg: PoCConfig, device: torch.device) -> DINOv2BackboneWrapper
     for p in model.parameters():
         p.requires_grad = False
     return DINOv2BackboneWrapper(model, cfg.layers)
+
+
+def ensure_backbone_ready(cfg: PoCConfig) -> None:
+    checkpoint_path = Path(cfg.checkpoint_path)
+    if checkpoint_path.exists() or cfg.allow_backbone_fallback:
+        return
+
+    raise FileNotFoundError(
+        "ADPretrain checkpoint missing. Please place the official ADPretrain DINOv2-base"
+        f" checkpoint at: {checkpoint_path}.\n"
+        "If you want a quick PoC run without ADPretrain weights, rerun with:"
+        " --allow-backbone-fallback"
+    )
 
 
 def evaluate(
@@ -457,6 +477,7 @@ def save_metrics(metrics: dict[str, float], out_dir: Path) -> None:
 def run_poc(cfg: PoCConfig) -> dict[str, float]:
     set_seed(cfg.seed)
     setup_project_dirs(cfg)
+    ensure_backbone_ready(cfg)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -506,7 +527,12 @@ def main() -> None:
         pca_dim=args.pca_dim,
         distance_type=args.distance_type,
     )
-    run_poc(cfg)
+    try:
+        run_poc(cfg)
+    except FileNotFoundError as exc:
+        print("\n[ERROR] Setup incomplete:\n")
+        print(str(exc))
+        raise
 
 
 if __name__ == "__main__":

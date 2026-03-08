@@ -29,14 +29,22 @@ Der vollständige PoC-Code liegt in:
 !git clone <DEIN_REPO_URL>
 %cd AnomalyD
 !pip install -r requirements.txt
-!python main.py
+!python main.py --allow-backbone-fallback
 ```
 
 Optional:
 
 ```python
-!python main.py --feature-size-factor 0.5 --num-prototypes 128 --distance-type l2
+!python main.py --feature-size-factor 0.5 --num-prototypes 128 --distance-type l2 --allow-backbone-fallback
 ```
+
+Für einen **strict ADPretrain-Lauf ohne Fallback** nutze stattdessen:
+
+```python
+!python main.py
+```
+
+und lege vorher den offiziellen Checkpoint unter `/content/project/checkpoints/adpretrain_dinov2_base.pth` ab.
 
 ---
 
