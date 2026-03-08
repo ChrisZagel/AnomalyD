@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import unittest
 
 try:
@@ -67,6 +69,16 @@ class PrototypeDistanceTests(unittest.TestCase):
         self.assertIn("aupro", rows[0])
         self.assertIn("image_f1", rows[0])
         self.assertIn("pixel_f1", rows[0])
+
+
+    def test_save_overlay_gallery_ignores_non_positive_examples(self) -> None:
+        from app.metal_nut_poc import save_overlay_gallery
+
+        class DummyDS:
+            def __getitem__(self, _idx):
+                raise AssertionError("Should not be called when num_examples <= 0")
+
+        save_overlay_gallery([], DummyDS(), None, None, Path("/tmp/unused.png"), num_examples=0)
 
     def test_supported_backbone_models_contains_requested_names(self) -> None:
         from app.metal_nut_poc import SUPPORTED_BACKBONE_MODELS

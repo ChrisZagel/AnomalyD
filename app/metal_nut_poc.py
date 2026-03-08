@@ -666,9 +666,11 @@ def save_overlay_gallery(
     out_path: Path,
     num_examples: int,
 ) -> None:
-    if not rows:
+    if not rows or num_examples <= 0:
         return
     top_rows = sorted(rows, key=lambda r: r["image_score"], reverse=True)[:num_examples]
+    if len(top_rows) == 0:
+        return
     fig, axes = plt.subplots(1, len(top_rows), figsize=(4 * len(top_rows), 4))
     if len(top_rows) == 1:
         axes = [axes]
@@ -807,7 +809,10 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
     print(json.dumps(metrics, indent=2))
     print(f"Per-sample report: {output_dir / 'per_sample_report.csv'}")
     print(f"Per-defect metrics: {output_dir / 'per_defect_metrics.csv'}")
-    print(f"Overlay gallery (false-color): {gallery_path}")
+    if cfg.num_visualization_examples > 0:
+        print(f"Overlay gallery (false-color): {gallery_path}")
+    else:
+        print("Overlay gallery skipped (--num-visualization-examples <= 0).")
     return metrics
 
 
