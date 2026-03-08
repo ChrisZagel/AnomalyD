@@ -275,26 +275,25 @@ class PrototypeAnomalyModel:
         self.mahalanobis_global_var = global_var
 
     def fit(self, dataset: MVTecMetalNutDataset, extractor: FeatureExtractor) -> None:
-        pca_samples = []
+        train_feature_blocks: list[np.ndarray] = []
         for sample in tqdm(dataset.samples, desc="Collect features for PCA"):
             image = Image.open(sample).convert("RGB")
             feats, _, _ = extractor.extract_patch_features(image)
-            pca_samples.append(feats)
+            train_feature_blocks.append(feats)
 
-        all_feats = np.concatenate(pca_samples, axis=0)
-        if all_feats.shape[0] > self.cfg.max_pca_samples:
-            idx = np.random.choice(all_feats.shape[0], self.cfg.max_pca_samples, replace=False)
-            all_feats = all_feats[idx]
+        all_train_feats = np.concatenate(train_feature_blocks, axis=0)
+        pca_fit_feats = all_train_feats
+        if all_train_feats.shape[0] > self.cfg.max_pca_samples:
+            idx = np.random.choice(all_train_feats.shape[0], self.cfg.max_pca_samples, replace=False)
+            pca_fit_feats = all_train_feats[idx]
 
         self.pca = PCA(n_components=self.cfg.pca_dim, random_state=self.cfg.seed)
-        self.pca.fit(all_feats)
+        self.pca.fit(pca_fit_feats)
 
-        reduced_train_feats = []
-        for sample in tqdm(dataset.samples, desc="Fit prototypes"):
-            image = Image.open(sample).convert("RGB")
-            feats, _, _ = extractor.extract_patch_features(image)
-            feats_red = self.pca.transform(feats)
-            reduced_train_feats.append(feats_red.astype(np.float32))
+        reduced_train_feats = [
+            self.pca.transform(feats).astype(np.float32)
+            for feats in tqdm(train_feature_blocks, desc="Fit prototypes")
+        ]
 
         all_train_red = np.concatenate(reduced_train_feats, axis=0)
         effective_clusters = self._resolve_num_clusters(self.cfg.num_prototypes, all_train_red.shape[0])
