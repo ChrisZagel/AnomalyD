@@ -18,10 +18,10 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
 from PIL import Image
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, label as cc_label
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.decomposition import PCA
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import precision_recall_curve, precision_recall_fscore_support, roc_auc_score
 from timm import create_model
 from tqdm.auto import tqdm
 
@@ -451,12 +451,13 @@ def evaluate(
     extractor: FeatureExtractor,
     proto_model: PrototypeAnomalyModel,
     out_dir: Path,
-) -> tuple[dict[str, float], list[dict[str, Any]]]:
+) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]]]:
     image_labels: list[int] = []
     image_scores: list[float] = []
     pixel_labels: list[np.ndarray] = []
     pixel_scores: list[np.ndarray] = []
     per_sample_rows: list[dict[str, Any]] = []
+    per_sample_eval: list[dict[str, Any]] = []
 
     vis_dir = out_dir / "visualizations"
     vis_dir.mkdir(parents=True, exist_ok=True)
@@ -484,6 +485,16 @@ def evaluate(
                 "map_max": float(anom_map.max()),
             }
         )
+        per_sample_eval.append(
+            {
+                "index": idx,
+                "defect_type": sample["defect_type"],
+                "label": sample["label"],
+                "image_score": float(image_score),
+                "mask": sample["mask"].astype(np.uint8),
+                "anom_map": anom_map.astype(np.float32),
+            }
+        )
 
         if saved_vis < 8:
             save_visualization(sample, anom_map, vis_dir / f"sample_{idx:03d}.png")
@@ -498,7 +509,7 @@ def evaluate(
         "mean_infer_time_sec": float(np.mean([r["infer_time_sec"] for r in per_sample_rows])),
         "std_infer_time_sec": float(np.std([r["infer_time_sec"] for r in per_sample_rows])),
     }
-    return metrics, per_sample_rows
+    return metrics, per_sample_rows, per_sample_eval
 
 
 def save_per_sample_report(rows: list[dict[str, Any]], out_dir: Path) -> None:
@@ -522,6 +533,129 @@ def compute_defect_level_aurocs(rows: list[dict[str, Any]]) -> dict[str, float]:
         y_score = np.array(good_scores + defect_scores)
         out[f"image_auroc_good_vs_{defect}"] = float(roc_auc_score(y_true, y_score))
     return out
+
+
+def _best_f1_threshold(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    precision, recall, thresholds = precision_recall_curve(y_true, y_score)
+    if thresholds.size == 0:
+        return float(np.median(y_score))
+    f1 = 2 * precision[:-1] * recall[:-1] / np.clip(precision[:-1] + recall[:-1], 1e-12, None)
+    best_idx = int(np.argmax(f1))
+    return float(thresholds[best_idx])
+
+
+def _compute_aupro_for_subset(records: list[dict[str, Any]], max_fpr: float = 0.3, num_steps: int = 200) -> float:
+    pos_records = [r for r in records if r["label"] == 1]
+    if not pos_records:
+        return float("nan")
+
+    all_scores = np.concatenate([r["anom_map"].ravel() for r in records])
+    if all_scores.size == 0:
+        return float("nan")
+
+    thresholds = np.linspace(float(all_scores.max()), float(all_scores.min()), num_steps)
+    fprs: list[float] = []
+    pros: list[float] = []
+
+    neg_pixels = sum(int((r["mask"] == 0).sum()) for r in records)
+    if neg_pixels == 0:
+        return float("nan")
+
+    for thr in thresholds:
+        fp = 0
+        region_overlaps: list[float] = []
+        for r in records:
+            pred = (r["anom_map"] >= thr).astype(np.uint8)
+            gt = r["mask"]
+            fp += int(((pred == 1) & (gt == 0)).sum())
+
+            if r["label"] == 1:
+                labeled, n_comp = cc_label(gt)
+                for cid in range(1, n_comp + 1):
+                    region = labeled == cid
+                    denom = int(region.sum())
+                    if denom > 0:
+                        region_overlaps.append(float(pred[region].sum()) / float(denom))
+
+        fpr = float(fp) / float(neg_pixels)
+        pro = float(np.mean(region_overlaps)) if region_overlaps else 0.0
+        fprs.append(fpr)
+        pros.append(pro)
+
+    fprs_arr = np.array(fprs)
+    pros_arr = np.array(pros)
+    order = np.argsort(fprs_arr)
+    fprs_arr = fprs_arr[order]
+    pros_arr = pros_arr[order]
+
+    mask = fprs_arr <= max_fpr
+    if not np.any(mask):
+        return 0.0
+
+    fprs_clip = np.concatenate([[0.0], fprs_arr[mask], [max_fpr]])
+    pros_interp = np.interp(fprs_clip, fprs_arr, pros_arr)
+    area = np.trapezoid(pros_interp, fprs_clip)
+    return float(area / max_fpr)
+
+
+def compute_per_defect_metrics(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    defect_types = sorted({r["defect_type"] for r in records if r["defect_type"] != "good"})
+    good_records = [r for r in records if r["defect_type"] == "good"]
+    out: list[dict[str, Any]] = []
+
+    for defect in defect_types:
+        defect_records = [r for r in records if r["defect_type"] == defect]
+        subset = good_records + defect_records
+
+        # Image-level metrics
+        y_true_img = np.array([0] * len(good_records) + [1] * len(defect_records), dtype=np.uint8)
+        y_score_img = np.array([r["image_score"] for r in subset], dtype=np.float32)
+        img_auroc = float(roc_auc_score(y_true_img, y_score_img))
+        img_thr = _best_f1_threshold(y_true_img, y_score_img)
+        y_pred_img = (y_score_img >= img_thr).astype(np.uint8)
+        img_prec, img_rec, img_f1, _ = precision_recall_fscore_support(
+            y_true_img, y_pred_img, average="binary", zero_division=0
+        )
+
+        # Pixel-level metrics
+        y_true_pix = np.concatenate([r["mask"].ravel() for r in subset]).astype(np.uint8)
+        y_score_pix = np.concatenate([r["anom_map"].ravel() for r in subset]).astype(np.float32)
+        pix_auroc = float(roc_auc_score(y_true_pix, y_score_pix))
+        pix_thr = _best_f1_threshold(y_true_pix, y_score_pix)
+        y_pred_pix = (y_score_pix >= pix_thr).astype(np.uint8)
+        pix_prec, pix_rec, pix_f1, _ = precision_recall_fscore_support(
+            y_true_pix, y_pred_pix, average="binary", zero_division=0
+        )
+
+        aupro = _compute_aupro_for_subset(subset)
+
+        out.append(
+            {
+                "defect_type": defect,
+                "num_good_images": len(good_records),
+                "num_defect_images": len(defect_records),
+                "image_auroc": img_auroc,
+                "pixel_auroc": pix_auroc,
+                "aupro": aupro,
+                "image_precision": float(img_prec),
+                "image_recall": float(img_rec),
+                "image_f1": float(img_f1),
+                "pixel_precision": float(pix_prec),
+                "pixel_recall": float(pix_rec),
+                "pixel_f1": float(pix_f1),
+            }
+        )
+    return out
+
+
+def save_per_defect_metrics(rows: list[dict[str, Any]], out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return
+    with open(out_dir / "per_defect_metrics.csv", "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def save_overlay_gallery(
@@ -622,7 +756,7 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
     proto_model.save(output_dir / "models")
 
     t_eval = time.perf_counter()
-    metrics, per_sample_rows = evaluate(test_ds, extractor, proto_model, output_dir)
+    metrics, per_sample_rows, per_sample_eval = evaluate(test_ds, extractor, proto_model, output_dir)
     eval_time = time.perf_counter() - t_eval
     total_time = time.perf_counter() - t_all
 
@@ -642,8 +776,22 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
         metrics["effective_num_prototypes"] = int(proto_model.centers.shape[0])
 
     metrics.update(compute_defect_level_aurocs(per_sample_rows))
-    save_metrics(metrics, output_dir)
     save_per_sample_report(per_sample_rows, output_dir)
+
+    per_defect_metrics = compute_per_defect_metrics(per_sample_eval)
+    save_per_defect_metrics(per_defect_metrics, output_dir)
+    for row in per_defect_metrics:
+        defect = row["defect_type"]
+        metrics[f"pixel_auroc_{defect}"] = float(row["pixel_auroc"])
+        metrics[f"aupro_{defect}"] = float(row["aupro"])
+        metrics[f"image_precision_{defect}"] = float(row["image_precision"])
+        metrics[f"image_recall_{defect}"] = float(row["image_recall"])
+        metrics[f"image_f1_{defect}"] = float(row["image_f1"])
+        metrics[f"pixel_precision_{defect}"] = float(row["pixel_precision"])
+        metrics[f"pixel_recall_{defect}"] = float(row["pixel_recall"])
+        metrics[f"pixel_f1_{defect}"] = float(row["pixel_f1"])
+
+    save_metrics(metrics, output_dir)
 
     gallery_path = output_dir / "visualizations" / "final_top5_overlay_gallery.png"
     save_overlay_gallery(
@@ -658,6 +806,7 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
     print("Final metrics:")
     print(json.dumps(metrics, indent=2))
     print(f"Per-sample report: {output_dir / 'per_sample_report.csv'}")
+    print(f"Per-defect metrics: {output_dir / 'per_defect_metrics.csv'}")
     print(f"Overlay gallery (false-color): {gallery_path}")
     return metrics
 

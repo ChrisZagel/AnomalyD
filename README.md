@@ -63,6 +63,7 @@ Nach erfolgreichem Lauf unter `/content/project/outputs/`:
 
 - `metrics.json` / `metrics.csv`
 - `per_sample_report.csv`
+- `per_defect_metrics.csv` (Pixel-AUROC, AUPRO, Image/Pixel Precision-Recall-F1 pro Fehlertyp)
 - `models/prototype_model.pkl`
 - `visualizations/*.png`
 - `visualizations/final_top5_overlay_gallery.png`

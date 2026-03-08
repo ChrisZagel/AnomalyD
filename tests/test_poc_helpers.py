@@ -42,6 +42,32 @@ class PrototypeDistanceTests(unittest.TestCase):
         self.assertEqual(model._resolve_num_clusters(256, 81), 81)
         self.assertEqual(model._resolve_num_clusters(64, 81), 64)
 
+
+    def test_compute_per_defect_metrics_has_required_fields(self) -> None:
+        from app.metal_nut_poc import compute_per_defect_metrics
+
+        good = {
+            "defect_type": "good",
+            "label": 0,
+            "image_score": 0.1,
+            "mask": np.zeros((4, 4), dtype=np.uint8),
+            "anom_map": np.zeros((4, 4), dtype=np.float32),
+        }
+        defect = {
+            "defect_type": "scratch",
+            "label": 1,
+            "image_score": 0.9,
+            "mask": np.pad(np.ones((2, 2), dtype=np.uint8), ((1, 1), (1, 1))),
+            "anom_map": np.pad(np.ones((2, 2), dtype=np.float32), ((1, 1), (1, 1))),
+        }
+        rows = compute_per_defect_metrics([good, defect])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["defect_type"], "scratch")
+        self.assertIn("pixel_auroc", rows[0])
+        self.assertIn("aupro", rows[0])
+        self.assertIn("image_f1", rows[0])
+        self.assertIn("pixel_f1", rows[0])
+
     def test_supported_backbone_models_contains_requested_names(self) -> None:
         from app.metal_nut_poc import SUPPORTED_BACKBONE_MODELS
 
