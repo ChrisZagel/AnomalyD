@@ -38,6 +38,12 @@ Optional:
 !python main.py --feature-size-factor 0.5 --num-prototypes 128 --distance-type l2 --allow-backbone-fallback
 ```
 
+Optional für mehr/andere Beispielbilder am Ende:
+
+```python
+!python main.py --allow-backbone-fallback --num-visualization-examples 5
+```
+
 Für einen **strict ADPretrain-Lauf ohne Fallback** nutze stattdessen:
 
 ```python
@@ -105,7 +111,9 @@ Nach erfolgreichem Lauf:
 
 - Modellartefakte: `/content/project/outputs/models/prototype_model.pkl`
 - Metriken: `/content/project/outputs/metrics.json` und `metrics.csv`
+- Per-Sample-Report: `/content/project/outputs/per_sample_report.csv`
 - Visualisierungen: `/content/project/outputs/visualizations/*.png`
+- Finale 5er-Overlay-Galerie (Falschfarbe): `/content/project/outputs/visualizations/final_top5_overlay_gallery.png`
 
 ---
 

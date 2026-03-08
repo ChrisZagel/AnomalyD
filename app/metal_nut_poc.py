@@ -6,6 +6,7 @@ import json
 import random
 import shutil
 import tarfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,7 @@ class PoCConfig:
     gaussian_sigma: float = 2.0
     max_pca_samples: int = 120_000
     layers: tuple[int, int, int] = (5, 8, 11)
+    num_visualization_examples: int = 5
 
 
 class MVTecMetalNutDataset:
@@ -73,10 +75,12 @@ class MVTecMetalNutDataset:
     def __getitem__(self, idx: int) -> dict[str, Any]:
         img_path = self.samples[idx]
         image = Image.open(img_path).convert("RGB")
+        defect_type = img_path.parent.name if self.split == "test" else "good"
         item = {
             "path": str(img_path),
             "image": image,
             "orig_size": image.size[::-1],
+            "defect_type": defect_type,
         }
 
         if self.split == "train":
@@ -84,7 +88,6 @@ class MVTecMetalNutDataset:
             item["mask"] = np.zeros(image.size[::-1], dtype=np.uint8)
             return item
 
-        defect_type = img_path.parent.name
         item["label"] = 0 if defect_type == "good" else 1
 
         if defect_type == "good":
@@ -499,11 +502,12 @@ def evaluate(
     extractor: FeatureExtractor,
     proto_model: PrototypeAnomalyModel,
     out_dir: Path,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], list[dict[str, Any]]]:
     image_labels: list[int] = []
     image_scores: list[float] = []
     pixel_labels: list[np.ndarray] = []
     pixel_scores: list[np.ndarray] = []
+    per_sample_rows: list[dict[str, Any]] = []
 
     vis_dir = out_dir / "visualizations"
     vis_dir.mkdir(parents=True, exist_ok=True)
@@ -511,12 +515,26 @@ def evaluate(
     saved_vis = 0
     for idx in tqdm(range(len(test_ds)), desc="Evaluate test set"):
         sample = test_ds[idx]
+        t0 = time.perf_counter()
         anom_map, image_score = proto_model.infer_map(sample["image"], extractor, sample["orig_size"])
+        infer_sec = time.perf_counter() - t0
 
         image_labels.append(sample["label"])
         image_scores.append(image_score)
         pixel_labels.append(sample["mask"].astype(np.uint8).ravel())
         pixel_scores.append(anom_map.ravel())
+        per_sample_rows.append(
+            {
+                "index": idx,
+                "path": sample["path"],
+                "defect_type": sample["defect_type"],
+                "label": sample["label"],
+                "image_score": float(image_score),
+                "infer_time_sec": float(infer_sec),
+                "map_mean": float(anom_map.mean()),
+                "map_max": float(anom_map.max()),
+            }
+        )
 
         if saved_vis < 8:
             save_visualization(sample, anom_map, vis_dir / f"sample_{idx:03d}.png")
@@ -524,11 +542,69 @@ def evaluate(
 
     image_auc = float(roc_auc_score(image_labels, image_scores))
     pixel_auc = float(roc_auc_score(np.concatenate(pixel_labels), np.concatenate(pixel_scores)))
-    return {
+    metrics = {
         "image_auroc": image_auc,
         "pixel_auroc": pixel_auc,
         "num_test_images": len(test_ds),
+        "mean_infer_time_sec": float(np.mean([r["infer_time_sec"] for r in per_sample_rows])),
+        "std_infer_time_sec": float(np.std([r["infer_time_sec"] for r in per_sample_rows])),
     }
+    return metrics, per_sample_rows
+
+
+def save_per_sample_report(rows: list[dict[str, Any]], out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_path = out_dir / "per_sample_report.csv"
+    if not rows:
+        return
+    with open(report_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def compute_defect_level_aurocs(rows: list[dict[str, Any]]) -> dict[str, float]:
+    good_scores = [r["image_score"] for r in rows if r["defect_type"] == "good"]
+    out: dict[str, float] = {}
+    defect_types = sorted({r["defect_type"] for r in rows if r["defect_type"] != "good"})
+    for defect in defect_types:
+        defect_scores = [r["image_score"] for r in rows if r["defect_type"] == defect]
+        y_true = np.array([0] * len(good_scores) + [1] * len(defect_scores))
+        y_score = np.array(good_scores + defect_scores)
+        out[f"image_auroc_good_vs_{defect}"] = float(roc_auc_score(y_true, y_score))
+    return out
+
+
+def save_overlay_gallery(
+    rows: list[dict[str, Any]],
+    test_ds: MVTecMetalNutDataset,
+    extractor: FeatureExtractor,
+    proto_model: PrototypeAnomalyModel,
+    out_path: Path,
+    num_examples: int,
+) -> None:
+    if not rows:
+        return
+    top_rows = sorted(rows, key=lambda r: r["image_score"], reverse=True)[:num_examples]
+    fig, axes = plt.subplots(1, len(top_rows), figsize=(4 * len(top_rows), 4))
+    if len(top_rows) == 1:
+        axes = [axes]
+
+    for ax, row in zip(axes, top_rows):
+        sample = test_ds[int(row["index"])]
+        anom_map, _ = proto_model.infer_map(sample["image"], extractor, sample["orig_size"])
+        image_np = np.array(sample["image"]) / 255.0
+        norm = (anom_map - anom_map.min()) / (anom_map.max() - anom_map.min() + 1e-8)
+        heat = plt.cm.jet(norm)[..., :3]
+        overlay = 0.6 * image_np + 0.4 * heat
+        ax.imshow(overlay)
+        ax.set_title(f"{sample['defect_type']}\nscore={row['image_score']:.3f}")
+        ax.axis("off")
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 def save_visualization(sample: dict[str, Any], anomaly_map: np.ndarray, out_path: Path) -> None:
@@ -569,6 +645,7 @@ def save_metrics(metrics: dict[str, float], out_dir: Path) -> None:
 
 
 def run_poc(cfg: PoCConfig) -> dict[str, float]:
+    t_all = time.perf_counter()
     set_seed(cfg.seed)
     setup_project_dirs(cfg)
     ensure_backbone_ready(cfg)
@@ -589,16 +666,49 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
     extractor = FeatureExtractor(backbone, device, cfg)
 
     proto_model = PrototypeAnomalyModel(cfg)
+    t_train = time.perf_counter()
     proto_model.fit(train_ds, extractor)
+    train_time = time.perf_counter() - t_train
 
     output_dir = Path(cfg.project_root) / "outputs"
     proto_model.save(output_dir / "models")
 
-    metrics = evaluate(test_ds, extractor, proto_model, output_dir)
+    t_eval = time.perf_counter()
+    metrics, per_sample_rows = evaluate(test_ds, extractor, proto_model, output_dir)
+    eval_time = time.perf_counter() - t_eval
+    total_time = time.perf_counter() - t_all
+
+    metrics.update(
+        {
+            "train_stage_sec": float(train_time),
+            "eval_stage_sec": float(eval_time),
+            "total_runtime_sec": float(total_time),
+            "train_images": len(train_ds),
+            "test_images": len(test_ds),
+        }
+    )
+
+    if proto_model.pca is not None:
+        metrics["pca_explained_variance_ratio_sum"] = float(np.sum(proto_model.pca.explained_variance_ratio_))
+
+    metrics.update(compute_defect_level_aurocs(per_sample_rows))
     save_metrics(metrics, output_dir)
+    save_per_sample_report(per_sample_rows, output_dir)
+
+    gallery_path = output_dir / "visualizations" / "final_top5_overlay_gallery.png"
+    save_overlay_gallery(
+        per_sample_rows,
+        test_ds,
+        extractor,
+        proto_model,
+        gallery_path,
+        num_examples=cfg.num_visualization_examples,
+    )
 
     print("Final metrics:")
     print(json.dumps(metrics, indent=2))
+    print(f"Per-sample report: {output_dir / 'per_sample_report.csv'}")
+    print(f"Overlay gallery (false-color): {gallery_path}")
     return metrics
 
 
@@ -615,6 +725,12 @@ def parse_args() -> argparse.Namespace:
         default="vit_base_patch14_dinov2.lvd142m",
         help="timm model name used when --allow-backbone-fallback is enabled.",
     )
+    parser.add_argument(
+        "--num-visualization-examples",
+        type=int,
+        default=5,
+        help="How many final false-color overlay examples to save.",
+    )
     return parser.parse_args()
 
 
@@ -627,6 +743,7 @@ def main() -> None:
         pca_dim=args.pca_dim,
         distance_type=args.distance_type,
         fallback_model_name=args.fallback_model_name,
+        num_visualization_examples=args.num_visualization_examples,
     )
     try:
         run_poc(cfg)
