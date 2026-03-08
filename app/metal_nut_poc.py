@@ -24,6 +24,7 @@ from sklearn.cluster import MiniBatchKMeans
 from sklearn.decomposition import PCA
 from sklearn.metrics import precision_recall_curve, precision_recall_fscore_support, roc_auc_score
 from timm import create_model
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 
@@ -189,9 +190,30 @@ class FeatureExtractor:
             ]
         )
 
+    def _collate_samples(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
+        tensors = [self.transform(sample["image"]) for sample in samples]
+        images = torch.stack(tensors, dim=0)
+        return {
+            "images": images,
+            "samples": samples,
+        }
+
+    def create_dataloader(self, dataset: MVTecMetalNutDataset) -> DataLoader:
+        return DataLoader(
+            dataset,
+            batch_size=self.cfg.batch_size,
+            shuffle=False,
+            num_workers=max(0, self.cfg.num_workers),
+            pin_memory=self.device.type == "cuda",
+            collate_fn=self._collate_samples,
+        )
+
     @torch.no_grad()
-    def extract_patch_features(self, image: Image.Image) -> tuple[np.ndarray, tuple[int, int], tuple[int, int]]:
-        tensor = self.transform(image).unsqueeze(0).to(self.device)
+    def extract_patch_features_batch(
+        self,
+        images: torch.Tensor,
+    ) -> tuple[list[np.ndarray], tuple[int, int], tuple[int, int]]:
+        tensor = images.to(self.device, non_blocking=True)
         orig_h, orig_w = tensor.shape[-2:]
         if self.cfg.feature_size_factor != 1.0:
             work_h = max(14, int(round(orig_h * self.cfg.feature_size_factor / 14) * 14))
@@ -212,8 +234,14 @@ class FeatureExtractor:
 
         fused = torch.cat(norm_maps, dim=1)
         b, c, h, w = fused.shape
-        patch_feats = fused.permute(0, 2, 3, 1).reshape(b * h * w, c)
-        return patch_feats.cpu().numpy(), (h, w), (work_h, work_w)
+        patch_feats = fused.permute(0, 2, 3, 1).reshape(b, h * w, c)
+        patch_feat_blocks = [patch_feats[i].cpu().numpy() for i in range(b)]
+        return patch_feat_blocks, (h, w), (work_h, work_w)
+
+    @torch.no_grad()
+    def extract_patch_features(self, image: Image.Image) -> tuple[np.ndarray, tuple[int, int], tuple[int, int]]:
+        batch_feats, grid_hw, work_hw = self.extract_patch_features_batch(self.transform(image).unsqueeze(0))
+        return batch_feats[0], grid_hw, work_hw
 
 
 class PrototypeAnomalyModel:
@@ -462,10 +490,10 @@ class PrototypeAnomalyModel:
             raw_cached = self._load_raw_feature_cache(raw_cache_path, sample_paths)
             if raw_cached is None:
                 train_feature_blocks: list[np.ndarray] = []
-                for sample in tqdm(dataset.samples, desc="Collect features for PCA"):
-                    image = Image.open(sample).convert("RGB")
-                    feats, _, _ = extractor.extract_patch_features(image)
-                    train_feature_blocks.append(feats.astype(np.float32))
+                train_loader = extractor.create_dataloader(dataset)
+                for batch in tqdm(train_loader, desc="Collect features for PCA"):
+                    batch_feats, _, _ = extractor.extract_patch_features_batch(batch["images"])
+                    train_feature_blocks.extend(feats.astype(np.float32) for feats in batch_feats)
 
                 block_sizes = np.array([x.shape[0] for x in train_feature_blocks], dtype=np.int64)
                 all_train_feats = np.concatenate(train_feature_blocks, axis=0).astype(np.float32)
@@ -556,16 +584,16 @@ class PrototypeAnomalyModel:
             raise ValueError(f"Unsupported distance_type: {self.cfg.distance_type}")
         return np.concatenate(mins, axis=0)
 
-    def infer_map(
+    def infer_map_from_features(
         self,
-        image: Image.Image,
-        extractor: FeatureExtractor,
+        feats: np.ndarray,
+        grid_hw: tuple[int, int],
+        work_hw: tuple[int, int],
         orig_size: tuple[int, int],
     ) -> tuple[np.ndarray, float]:
         if self.pca is None or self.centers is None:
             raise RuntimeError("Model is not fitted yet.")
 
-        feats, grid_hw, work_hw = extractor.extract_patch_features(image)
         feats_red = self.pca.transform(feats)
         patch_scores = self._chunked_min_distance(feats_red.astype(np.float32), self.centers)
 
@@ -580,6 +608,15 @@ class PrototypeAnomalyModel:
         topk = max(1, int(full_map.size * self.cfg.topk_percent / 100.0))
         image_score = float(np.mean(np.partition(full_map.ravel(), -topk)[-topk:]))
         return full_map, image_score
+
+    def infer_map(
+        self,
+        image: Image.Image,
+        extractor: FeatureExtractor,
+        orig_size: tuple[int, int],
+    ) -> tuple[np.ndarray, float]:
+        feats, grid_hw, work_hw = extractor.extract_patch_features(image)
+        return self.infer_map_from_features(feats, grid_hw, work_hw, orig_size)
 
 
 def set_seed(seed: int) -> None:
@@ -718,42 +755,49 @@ def evaluate(
     vis_dir.mkdir(parents=True, exist_ok=True)
 
     saved_vis = 0
-    for idx in tqdm(range(len(test_ds)), desc="Evaluate test set"):
-        sample = test_ds[idx]
+    sample_idx = 0
+    test_loader = extractor.create_dataloader(test_ds)
+    for batch in tqdm(test_loader, desc="Evaluate test set"):
+        samples = batch["samples"]
         t0 = time.perf_counter()
-        anom_map, image_score = proto_model.infer_map(sample["image"], extractor, sample["orig_size"])
-        infer_sec = time.perf_counter() - t0
+        batch_feats, grid_hw, work_hw = extractor.extract_patch_features_batch(batch["images"])
+        batch_infer_sec = time.perf_counter() - t0
 
-        image_labels.append(sample["label"])
-        image_scores.append(image_score)
-        pixel_labels.append(sample["mask"].astype(np.uint8).ravel())
-        pixel_scores.append(anom_map.ravel())
-        per_sample_rows.append(
-            {
-                "index": idx,
-                "path": sample["path"],
-                "defect_type": sample["defect_type"],
-                "label": sample["label"],
-                "image_score": float(image_score),
-                "infer_time_sec": float(infer_sec),
-                "map_mean": float(anom_map.mean()),
-                "map_max": float(anom_map.max()),
-            }
-        )
-        per_sample_eval.append(
-            {
-                "index": idx,
-                "defect_type": sample["defect_type"],
-                "label": sample["label"],
-                "image_score": float(image_score),
-                "mask": sample["mask"].astype(np.uint8),
-                "anom_map": anom_map.astype(np.float32),
-            }
-        )
+        for sample, feats in zip(samples, batch_feats):
+            anom_map, image_score = proto_model.infer_map_from_features(feats, grid_hw, work_hw, sample["orig_size"])
+            infer_sec = batch_infer_sec / max(1, len(samples))
 
-        if saved_vis < 8:
-            save_visualization(sample, anom_map, vis_dir / f"sample_{idx:03d}.png")
-            saved_vis += 1
+            image_labels.append(sample["label"])
+            image_scores.append(image_score)
+            pixel_labels.append(sample["mask"].astype(np.uint8).ravel())
+            pixel_scores.append(anom_map.ravel())
+            per_sample_rows.append(
+                {
+                    "index": sample_idx,
+                    "path": sample["path"],
+                    "defect_type": sample["defect_type"],
+                    "label": sample["label"],
+                    "image_score": float(image_score),
+                    "infer_time_sec": float(infer_sec),
+                    "map_mean": float(anom_map.mean()),
+                    "map_max": float(anom_map.max()),
+                }
+            )
+            per_sample_eval.append(
+                {
+                    "index": sample_idx,
+                    "defect_type": sample["defect_type"],
+                    "label": sample["label"],
+                    "image_score": float(image_score),
+                    "mask": sample["mask"].astype(np.uint8),
+                    "anom_map": anom_map.astype(np.float32),
+                }
+            )
+
+            if saved_vis < 8:
+                save_visualization(sample, anom_map, vis_dir / f"sample_{sample_idx:03d}.png")
+                saved_vis += 1
+            sample_idx += 1
 
     image_auc = float(roc_auc_score(image_labels, image_scores))
     pixel_auc = float(roc_auc_score(np.concatenate(pixel_labels), np.concatenate(pixel_scores)))
@@ -1084,6 +1128,13 @@ def parse_args() -> argparse.Namespace:
         choices=SUPPORTED_BACKBONE_MODELS,
         help="Pretrained timm backbone model name.",
     )
+    parser.add_argument("--batch-size", type=int, default=4, help="DataLoader batch size for feature extraction.")
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=2,
+        help="DataLoader workers (set 0 as robust fallback, e.g. for Colab multiprocessing issues).",
+    )
     parser.add_argument(
         "--num-visualization-examples",
         type=int,
@@ -1104,6 +1155,8 @@ def main() -> None:
         num_prototypes=args.num_prototypes,
         pca_dim=args.pca_dim,
         distance_type=args.distance_type,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
         num_visualization_examples=args.num_visualization_examples,
         mahalanobis_alpha=args.mahalanobis_alpha,
         mahalanobis_min_var=args.mahalanobis_min_var,
