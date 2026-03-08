@@ -35,6 +35,13 @@ class PrototypeDistanceTests(unittest.TestCase):
         out = model._chunked_min_distance(x, c, chunk_size=5)
         self.assertTrue(np.all(out >= 0))
 
+
+    def test_resolve_num_clusters_caps_at_samples(self) -> None:
+        cfg = self.PoCConfig()
+        model = self.PrototypeAnomalyModel(cfg)
+        self.assertEqual(model._resolve_num_clusters(256, 81), 81)
+        self.assertEqual(model._resolve_num_clusters(64, 81), 64)
+
     def test_supported_backbone_models_contains_requested_names(self) -> None:
         from app.metal_nut_poc import SUPPORTED_BACKBONE_MODELS
 

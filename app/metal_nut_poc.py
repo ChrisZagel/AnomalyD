@@ -218,6 +218,12 @@ class PrototypeAnomalyModel:
         self.pca: PCA | None = None
         self.centers: np.ndarray | None = None
 
+    @staticmethod
+    def _resolve_num_clusters(requested: int, n_samples: int) -> int:
+        if n_samples <= 0:
+            raise ValueError("No training samples available for clustering.")
+        return max(1, min(requested, n_samples))
+
     def fit(self, dataset: MVTecMetalNutDataset, extractor: FeatureExtractor) -> None:
         pca_samples = []
         for sample in tqdm(dataset.samples, desc="Collect features for PCA"):
@@ -233,17 +239,28 @@ class PrototypeAnomalyModel:
         self.pca = PCA(n_components=self.cfg.pca_dim, random_state=self.cfg.seed)
         self.pca.fit(all_feats)
 
-        kmeans = MiniBatchKMeans(
-            n_clusters=self.cfg.num_prototypes,
-            random_state=self.cfg.seed,
-            batch_size=4096,
-            n_init="auto",
-        )
+        reduced_train_feats = []
         for sample in tqdm(dataset.samples, desc="Fit prototypes"):
             image = Image.open(sample).convert("RGB")
             feats, _, _ = extractor.extract_patch_features(image)
             feats_red = self.pca.transform(feats)
-            kmeans.partial_fit(feats_red)
+            reduced_train_feats.append(feats_red.astype(np.float32))
+
+        all_train_red = np.concatenate(reduced_train_feats, axis=0)
+        effective_clusters = self._resolve_num_clusters(self.cfg.num_prototypes, all_train_red.shape[0])
+        if effective_clusters != self.cfg.num_prototypes:
+            print(
+                f"[WARN] Reducing num_prototypes from {self.cfg.num_prototypes} to {effective_clusters} "
+                f"because only {all_train_red.shape[0]} reduced patch samples are available."
+            )
+
+        kmeans = MiniBatchKMeans(
+            n_clusters=effective_clusters,
+            random_state=self.cfg.seed,
+            batch_size=4096,
+            n_init="auto",
+        )
+        kmeans.fit(all_train_red)
 
         self.centers = kmeans.cluster_centers_.astype(np.float32)
 
@@ -621,6 +638,8 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
 
     if proto_model.pca is not None:
         metrics["pca_explained_variance_ratio_sum"] = float(np.sum(proto_model.pca.explained_variance_ratio_))
+    if proto_model.centers is not None:
+        metrics["effective_num_prototypes"] = int(proto_model.centers.shape[0])
 
     metrics.update(compute_defect_level_aurocs(per_sample_rows))
     save_metrics(metrics, output_dir)

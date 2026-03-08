@@ -72,3 +72,8 @@ Nach erfolgreichem Lauf unter `/content/project/outputs/`:
 ## Hinweis
 
 ADPretrain-Checkpoint-Support wurde entfernt; der PoC arbeitet jetzt ausschließlich mit direkt verfügbaren pretrained timm-Weights über `--backbone-model-name`.
+
+
+## Stabilität bei kleiner Feature-Map
+
+Wenn ein Backbone eine sehr grobe Feature-Map liefert (z. B. wenige Patch-Features pro Bild), wird die effektive Anzahl der Prototypen automatisch auf die verfügbare Anzahl reduzierter Trainings-Patches begrenzt. Dadurch wird der Fehler `n_samples < n_clusters` vermieden.
