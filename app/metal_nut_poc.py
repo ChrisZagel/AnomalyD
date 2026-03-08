@@ -39,6 +39,7 @@ class PoCConfig:
     project_root: str = "/content/project"
     checkpoint_path: str = "/content/project/checkpoints/adpretrain_dinov2_base.pth"
     allow_backbone_fallback: bool = False
+    fallback_model_name: str = "vit_base_patch14_dinov2.lvd142m"
     feature_size_factor: float = 0.75
     num_prototypes: int = 256
     pca_dim: int = 128
@@ -357,28 +358,118 @@ def ensure_dataset(cfg: PoCConfig) -> Path:
     return target_root
 
 
+def _strip_known_prefixes(key: str) -> str:
+    prefixes = (
+        "module.",
+        "model.",
+        "backbone.",
+        "encoder.",
+        "network.",
+        "net.",
+        "student.",
+        "teacher.",
+    )
+    changed = True
+    while changed:
+        changed = False
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                key = key[len(prefix) :]
+                changed = True
+    return key
+
+
+def _collect_tensor_dict_candidates(raw: Any) -> list[tuple[str, dict[str, torch.Tensor]]]:
+    candidates: list[tuple[str, dict[str, torch.Tensor]]] = []
+    queue: list[tuple[str, Any]] = [("root", raw)]
+    while queue:
+        name, obj = queue.pop(0)
+        if not isinstance(obj, dict):
+            continue
+
+        tensor_items = {k: v for k, v in obj.items() if isinstance(k, str) and torch.is_tensor(v)}
+        if tensor_items:
+            candidates.append((name, tensor_items))
+
+        for k, v in obj.items():
+            if isinstance(v, dict):
+                queue.append((f"{name}.{k}", v))
+    return candidates
+
+
+def _prepare_checkpoint_state_dict(raw: Any, model: torch.nn.Module) -> tuple[dict[str, torch.Tensor], str]:
+    model_state = model.state_dict()
+    candidates = _collect_tensor_dict_candidates(raw)
+    if not candidates:
+        raise RuntimeError("Checkpoint does not contain any tensor state dictionaries.")
+
+    best_name = ""
+    best_state: dict[str, torch.Tensor] = {}
+    best_score = -1
+
+    for cand_name, cand in candidates:
+        remapped = {_strip_known_prefixes(k): v for k, v in cand.items()}
+        compatible = {
+            k: v
+            for k, v in remapped.items()
+            if k in model_state and tuple(v.shape) == tuple(model_state[k].shape)
+        }
+        if len(compatible) > best_score:
+            best_score = len(compatible)
+            best_name = cand_name
+            best_state = compatible
+
+    if best_score <= 0:
+        raise RuntimeError(
+            "No compatible weights found in checkpoint. Expected ViT-B/14 style keys, "
+            "possibly with prefixes like module/model/backbone/student/teacher."
+        )
+
+    return best_state, best_name
+
+
+def _create_fallback_model(model_name: str) -> torch.nn.Module:
+    try:
+        model = create_model(model_name, pretrained=True, dynamic_img_size=True)
+    except TypeError:
+        model = create_model(model_name, pretrained=True)
+    return model
+
+
 def load_backbone(cfg: PoCConfig, device: torch.device) -> DINOv2BackboneWrapper:
     checkpoint_path = Path(cfg.checkpoint_path)
     model = create_model("vit_base_patch14_dinov2.lvd142m", pretrained=False, dynamic_img_size=True)
 
     if checkpoint_path.exists():
         raw = torch.load(checkpoint_path, map_location="cpu")
-        state = raw.get("state_dict", raw)
-        cleaned = {k.replace("module.", ""): v for k, v in state.items()}
-        missing, unexpected = model.load_state_dict(cleaned, strict=False)
-        print(f"Loaded checkpoint: {checkpoint_path}")
-        if missing:
-            print(f"Missing keys ({len(missing)}), first 5: {missing[:5]}")
-        if unexpected:
-            print(f"Unexpected keys ({len(unexpected)}), first 5: {unexpected[:5]}")
+        try:
+            prepared_state, src_name = _prepare_checkpoint_state_dict(raw, model)
+            missing, unexpected = model.load_state_dict(prepared_state, strict=False)
+            print(f"Loaded ADPretrain checkpoint: {checkpoint_path}")
+            print(f"State dict source: {src_name}, loaded keys: {len(prepared_state)}")
+            if missing:
+                print(f"Missing keys ({len(missing)}), first 5: {missing[:5]}")
+            if unexpected:
+                print(f"Unexpected keys ({len(unexpected)}), first 5: {unexpected[:5]}")
+        except Exception as exc:
+            if not cfg.allow_backbone_fallback:
+                raise RuntimeError(
+                    "Failed to load ADPretrain checkpoint. "
+                    "Please verify that the file is a DINOv2-base style checkpoint. "
+                    "To continue anyway, set --allow-backbone-fallback.\n"
+                    f"Details: {exc}"
+                ) from exc
+            print(f"ADPretrain checkpoint is incompatible: {exc}")
+            print(f"Falling back to pretrained timm model: {cfg.fallback_model_name}")
+            model = _create_fallback_model(cfg.fallback_model_name)
     elif cfg.allow_backbone_fallback:
-        print("ADPretrain checkpoint not found. Falling back to vanilla DINOv2-base weights.")
-        model = create_model("vit_base_patch14_dinov2.lvd142m", pretrained=True, dynamic_img_size=True)
+        print(f"ADPretrain checkpoint not found. Falling back to pretrained timm model: {cfg.fallback_model_name}")
+        model = _create_fallback_model(cfg.fallback_model_name)
     else:
         raise FileNotFoundError(
             "ADPretrain checkpoint missing. Please place the official ADPretrain DINOv2-base"
             f" checkpoint at: {checkpoint_path}.\n"
-            "Set allow_backbone_fallback=True only if you explicitly want vanilla DINOv2-base fallback."
+            "Set allow_backbone_fallback=True only if you explicitly want fallback pretrained weights."
         )
 
     if hasattr(model, "patch_embed") and hasattr(model.patch_embed, "strict_img_size"):
@@ -399,7 +490,7 @@ def ensure_backbone_ready(cfg: PoCConfig) -> None:
         "ADPretrain checkpoint missing. Please place the official ADPretrain DINOv2-base"
         f" checkpoint at: {checkpoint_path}.\n"
         "If you want a quick PoC run without ADPretrain weights, rerun with:"
-        " --allow-backbone-fallback"
+        " --allow-backbone-fallback (optional: --fallback-model-name <timm_model>)"
     )
 
 
@@ -518,6 +609,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-prototypes", type=int, default=256)
     parser.add_argument("--pca-dim", type=int, default=128)
     parser.add_argument("--distance-type", type=str, default="cosine", choices=["cosine", "l2"])
+    parser.add_argument(
+        "--fallback-model-name",
+        type=str,
+        default="vit_base_patch14_dinov2.lvd142m",
+        help="timm model name used when --allow-backbone-fallback is enabled.",
+    )
     return parser.parse_args()
 
 
@@ -529,6 +626,7 @@ def main() -> None:
         num_prototypes=args.num_prototypes,
         pca_dim=args.pca_dim,
         distance_type=args.distance_type,
+        fallback_model_name=args.fallback_model_name,
     )
     try:
         run_poc(cfg)

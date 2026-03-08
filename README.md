@@ -87,7 +87,15 @@ Verhalten:
 python main.py --allow-backbone-fallback
 ```
 
+Optional kannst du alternative timm-Pretrained-Weights für den Fallback setzen, z. B.:
+
+```bash
+python main.py --allow-backbone-fallback --fallback-model-name vit_base_patch14_reg4_dinov2.lvd142m
+```
+
 Dieser Fallback ist bewusst **nicht** stillschweigend aktiv.
+
+Hinweis: Der ADPretrain-Loader akzeptiert auch häufige Checkpoint-Container/Prefixe (z. B. `state_dict`, `model`, `backbone`, `student`, `teacher`, `module`) und mappt kompatible DINOv2-Base-Keys automatisch.
 
 ---
 

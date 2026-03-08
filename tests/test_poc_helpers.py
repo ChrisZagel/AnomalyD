@@ -36,6 +36,13 @@ class PrototypeDistanceTests(unittest.TestCase):
         out = model._chunked_min_distance(x, c, chunk_size=5)
         self.assertTrue(np.all(out >= 0))
 
+
+    def test_strip_known_prefixes(self) -> None:
+        from app.metal_nut_poc import _strip_known_prefixes
+
+        self.assertEqual(_strip_known_prefixes("module.backbone.student.blocks.0.norm1.weight"), "blocks.0.norm1.weight")
+        self.assertEqual(_strip_known_prefixes("encoder.patch_embed.proj.weight"), "patch_embed.proj.weight")
+
     def test_missing_checkpoint_message_contains_fallback_hint(self) -> None:
         cfg = self.PoCConfig(checkpoint_path=str(Path("/tmp/does_not_exist.pth")), allow_backbone_fallback=False)
         with self.assertRaises(FileNotFoundError) as ctx:
