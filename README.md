@@ -4,172 +4,71 @@
 
 Dieser PoC implementiert eine **normal-only, patch-basierte Anomalieerkennung** auf **MVTec AD `metal_nut`**:
 
-1. **Gefrorener Backbone:** DINOv2-base (bevorzugt ADPretrain-Checkpoint).
-2. **Multi-Level Features:** 3 Transformer-Ebenen (mittel, spät-mittel, spät).
-3. **Feature-Fusion:** Ebenen auf ein gemeinsames Token-Raster, L2-Norm, Concat.
-4. **Dimensionalitätsreduktion:** PCA (z. B. 128-dim).
-5. **Normalitätsmodell:** MiniBatchKMeans-Prototypen auf `train/good`.
-6. **Inference:** Minimaldistanz pro Patch zu Prototypen (Cosine/L2) → Anomaly Map + Image Score.
-7. **Evaluation:** Image-AUROC + Pixel-AUROC auf `test/*` inkl. MVTec-Masken.
+1. **Gefrorener Backbone:** vortrainiertes timm-Backbone (konfigurierbar über `--backbone-model-name`).
+2. **Multi-Level Features:** 3 Ebenen (ViT-Intermediate oder letzte 3 `features_only`-Maps bei CNN/Hybrid-Backbones).
+3. **Feature-Fusion:** Ebenen auf gemeinsames Raster, L2-Norm, Concat.
+4. **PCA + Prototypen:** PCA-Reduktion und MiniBatchKMeans auf `train/good`.
+5. **Inference:** Distanz zu Prototypen -> Pixel-Anomaly-Map + Image-Score.
+6. **Evaluation:** Image-AUROC + Pixel-AUROC, plus Profiling-/Diagnose-Outputs.
 
-Die Pipeline ist CPU/GPU-kompatibel, ohne Finetuning, mit robusten Checks und Colab-freundlichen Abhängigkeiten.
+Die Pipeline läuft auf CPU und GPU in Colab.
 
 ---
 
-## Vollständiger Code
-
-Der vollständige PoC-Code liegt in:
-
-- `app/metal_nut_poc.py`
-- Einstiegspunkt: `main.py`
-
-### Start in Colab
+## Start in Colab
 
 ```python
 !git clone <DEIN_REPO_URL>
 %cd AnomalyD
 !pip install -r requirements.txt
-!python main.py --allow-backbone-fallback
+!python main.py --backbone-model-name vit_base_patch14_dinov2.lvd142m
 ```
 
-Optional:
+Beispiele:
 
 ```python
-!python main.py --feature-size-factor 0.5 --num-prototypes 128 --distance-type l2 --allow-backbone-fallback
+!python main.py --backbone-model-name vit_small_patch14_dinov2.lvd142m
+!python main.py --backbone-model-name shvit_s4.in1k
+!python main.py --backbone-model-name edgenext_small.usi_in1k
 ```
-
-Optional für mehr/andere Beispielbilder am Ende:
-
-```python
-!python main.py --allow-backbone-fallback --num-visualization-examples 5
-```
-
-Für einen **strict ADPretrain-Lauf ohne Fallback** nutze stattdessen:
-
-```python
-!python main.py
-```
-
-und lege vorher den offiziellen Checkpoint unter `/content/project/checkpoints/adpretrain_dinov2_base.pth` ab.
 
 ---
 
-## Colab-Zellen-Reihenfolge (empfohlen)
+## Unterstützte Backbones / Weights
 
-1. **Setup + Install**
-   - `pip install -r requirements.txt`
-2. **Imports + Config prüfen**
-   - optional Datei `app/metal_nut_poc.py` öffnen
-3. **Geräteerkennung**
-   - passiert automatisch (`cuda` falls verfügbar, sonst `cpu`)
-4. **Download + Extraktion `metal_nut`**
-   - automatisch über `ensure_dataset(...)`
-5. **Dataset-Checks**
-   - automatisch durch Strukturprüfungen
-6. **Backbone laden**
-   - ADPretrain-Checkpoint aus `/content/project/checkpoints/adpretrain_dinov2_base.pth`
-7. **Trainingsfeatures extrahieren**
-8. **PCA + Prototypen fitten**
-9. **Evaluation auf Testset**
-10. **Visualisierungen speichern**
-11. **Metriken als JSON/CSV speichern**
-
----
-
-## ADPretrain-Checkpoint bereitstellen
-
-Standardpfad:
-
-```text
-/content/project/checkpoints/adpretrain_dinov2_base.pth
-```
-
-Verhalten:
-
-- Wenn der Checkpoint fehlt und `allow_backbone_fallback=False` (Default), bricht der Code mit klarer Fehlermeldung ab.
-- Optional kann ein Fallback auf vanilla DINOv2-base aktiviert werden:
-
-```bash
-python main.py --allow-backbone-fallback
-```
-
-Optional kannst du alternative timm-Pretrained-Weights für den Fallback setzen, z. B.:
-
-```bash
-python main.py --allow-backbone-fallback --fallback-model-name vit_base_patch14_reg4_dinov2.lvd142m
-```
-
-Dieser Fallback ist bewusst **nicht** stillschweigend aktiv.
-
-Hinweis: Der ADPretrain-Loader akzeptiert auch häufige Checkpoint-Container/Prefixe (z. B. `state_dict`, `model`, `backbone`, `student`, `teacher`, `module`) und mappt kompatible DINOv2-Base-Keys automatisch.
-
----
-
-## Outputs
-
-Nach erfolgreichem Lauf:
-
-- Modellartefakte: `/content/project/outputs/models/prototype_model.pkl`
-- Metriken: `/content/project/outputs/metrics.json` und `metrics.csv`
-- Per-Sample-Report: `/content/project/outputs/per_sample_report.csv`
-- Visualisierungen: `/content/project/outputs/visualizations/*.png`
-- Finale 5er-Overlay-Galerie (Falschfarbe): `/content/project/outputs/visualizations/final_top5_overlay_gallery.png`
-
----
-
-## Mögliche spätere Erweiterungen
-
-- AUPRO/PRO-Metrik ergänzen.
-- Mehr Kategorien neben `metal_nut` unterstützen.
-- Feature-Sampling/Streaming weiter optimieren für sehr große Sets.
-- Alternative Prototypenmodelle (z. B. GMM, kNN-Memory) als Vergleich.
-
-
-## Unterstützte Backbone-Namen
-
-Folgende Modelle werden jetzt explizit unterstützt (für `--backbone-model-name` und `--fallback-model-name`):
+Folgende Namen werden explizit unterstützt:
 
 - `vit_base_patch14_dinov2.lvd142m`
 - `vit_base_patch14_reg4_dinov2.lvd142m`
 - `vit_small_patch14_dinov2.lvd142m`
-- `vit_small_patch14_reg4_dinov2.lvd142m`
-- `vit_base_patch16_224.dino`
-- `vit_small_patch16_224.dino`
+- `shvit_s4.in1k`
+- `edgenext_small.usi_in1k`
 
-Beispiele:
+---
 
-```bash
-python main.py --allow-backbone-fallback --fallback-model-name vit_small_patch14_dinov2.lvd142m
-python main.py --allow-backbone-fallback --fallback-model-name vit_base_patch16_224.dino
-```
+## Wichtige CLI-Parameter
 
-Wenn du einen ADPretrain-Checkpoint für ein anderes Backbone hast, setze zusätzlich:
-
-```bash
-python main.py --backbone-model-name vit_small_patch14_reg4_dinov2.lvd142m
-```
-
-Dieser Fallback ist bewusst **nicht** stillschweigend aktiv.
-
-Hinweis: Der ADPretrain-Loader akzeptiert auch häufige Checkpoint-Container/Prefixe (z. B. `state_dict`, `model`, `backbone`, `student`, `teacher`, `module`) und mappt kompatible DINOv2-Base-Keys automatisch.
+- `--backbone-model-name` (siehe Liste oben)
+- `--feature-size-factor` (z. B. `1.0`, `0.75`, `0.5`)
+- `--num-prototypes` (z. B. `256`)
+- `--pca-dim` (z. B. `128`)
+- `--distance-type` (`cosine` oder `l2`)
+- `--num-visualization-examples` (Default `5`)
 
 ---
 
 ## Outputs
 
-Nach erfolgreichem Lauf:
+Nach erfolgreichem Lauf unter `/content/project/outputs/`:
 
-- Modellartefakte: `/content/project/outputs/models/prototype_model.pkl`
-- Metriken: `/content/project/outputs/metrics.json` und `metrics.csv`
-- Per-Sample-Report: `/content/project/outputs/per_sample_report.csv`
-- Visualisierungen: `/content/project/outputs/visualizations/*.png`
-- Finale 5er-Overlay-Galerie (Falschfarbe): `/content/project/outputs/visualizations/final_top5_overlay_gallery.png`
+- `metrics.json` / `metrics.csv`
+- `per_sample_report.csv`
+- `models/prototype_model.pkl`
+- `visualizations/*.png`
+- `visualizations/final_top5_overlay_gallery.png`
 
 ---
 
-## Mögliche spätere Erweiterungen
+## Hinweis
 
-- AUPRO/PRO-Metrik ergänzen.
-- Mehr Kategorien neben `metal_nut` unterstützen.
-- Feature-Sampling/Streaming weiter optimieren für sehr große Sets.
-- Alternative Prototypenmodelle (z. B. GMM, kNN-Memory) als Vergleich.
+ADPretrain-Checkpoint-Support wurde entfernt; der PoC arbeitet jetzt ausschließlich mit direkt verfügbaren pretrained timm-Weights über `--backbone-model-name`.

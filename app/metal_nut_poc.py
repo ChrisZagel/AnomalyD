@@ -30,9 +30,8 @@ SUPPORTED_BACKBONE_MODELS: tuple[str, ...] = (
     "vit_base_patch14_dinov2.lvd142m",
     "vit_base_patch14_reg4_dinov2.lvd142m",
     "vit_small_patch14_dinov2.lvd142m",
-    "vit_small_patch14_reg4_dinov2.lvd142m",
-    "vit_base_patch16_224.dino",
-    "vit_small_patch16_224.dino",
+    "shvit_s4.in1k",
+    "edgenext_small.usi_in1k",
 )
 
 
@@ -48,10 +47,7 @@ class PoCConfig:
     archive_path: str = "/content/data/metal_nut.tar.xz"
     extract_root: str = "/content/data/mvtec_ad"
     project_root: str = "/content/project"
-    checkpoint_path: str = "/content/project/checkpoints/adpretrain_dinov2_base.pth"
-    allow_backbone_fallback: bool = False
     backbone_model_name: str = "vit_base_patch14_dinov2.lvd142m"
-    fallback_model_name: str = "vit_base_patch14_dinov2.lvd142m"
     feature_size_factor: float = 0.75
     num_prototypes: int = 256
     pca_dim: int = 128
@@ -156,8 +152,24 @@ class DINOv2BackboneWrapper(torch.nn.Module):
         return maps
 
 
+class TimmFeaturesBackboneWrapper(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        feats = self.model(x)
+        if not isinstance(feats, (list, tuple)):
+            raise RuntimeError("features_only model did not return a feature list.")
+        if len(feats) < 3:
+            raise RuntimeError(
+                f"Backbone returned only {len(feats)} feature maps, need at least 3 for multi-level fusion."
+            )
+        return [f for f in feats[-3:]]
+
+
 class FeatureExtractor:
-    def __init__(self, backbone: DINOv2BackboneWrapper, device: torch.device, cfg: PoCConfig) -> None:
+    def __init__(self, backbone: torch.nn.Module, device: torch.device, cfg: PoCConfig) -> None:
         self.backbone = backbone.eval().to(device)
         self.device = device
         self.cfg = cfg
@@ -372,158 +384,42 @@ def ensure_dataset(cfg: PoCConfig) -> Path:
     return target_root
 
 
-def _strip_known_prefixes(key: str) -> str:
-    prefixes = (
-        "module.",
-        "model.",
-        "backbone.",
-        "encoder.",
-        "network.",
-        "net.",
-        "student.",
-        "teacher.",
-    )
-    changed = True
-    while changed:
-        changed = False
-        for prefix in prefixes:
-            if key.startswith(prefix):
-                key = key[len(prefix) :]
-                changed = True
-    return key
-
-
-def _collect_tensor_dict_candidates(raw: Any) -> list[tuple[str, dict[str, torch.Tensor]]]:
-    candidates: list[tuple[str, dict[str, torch.Tensor]]] = []
-    queue: list[tuple[str, Any]] = [("root", raw)]
-    while queue:
-        name, obj = queue.pop(0)
-        if not isinstance(obj, dict):
-            continue
-
-        tensor_items = {k: v for k, v in obj.items() if isinstance(k, str) and torch.is_tensor(v)}
-        if tensor_items:
-            candidates.append((name, tensor_items))
-
-        for k, v in obj.items():
-            if isinstance(v, dict):
-                queue.append((f"{name}.{k}", v))
-    return candidates
-
-
-def _prepare_checkpoint_state_dict(raw: Any, model: torch.nn.Module) -> tuple[dict[str, torch.Tensor], str]:
-    model_state = model.state_dict()
-    candidates = _collect_tensor_dict_candidates(raw)
-    if not candidates:
-        raise RuntimeError("Checkpoint does not contain any tensor state dictionaries.")
-
-    best_name = ""
-    best_state: dict[str, torch.Tensor] = {}
-    best_score = -1
-
-    for cand_name, cand in candidates:
-        remapped = {_strip_known_prefixes(k): v for k, v in cand.items()}
-        compatible = {
-            k: v
-            for k, v in remapped.items()
-            if k in model_state and tuple(v.shape) == tuple(model_state[k].shape)
-        }
-        if len(compatible) > best_score:
-            best_score = len(compatible)
-            best_name = cand_name
-            best_state = compatible
-
-    if best_score <= 0:
-        raise RuntimeError(
-            "No compatible weights found in checkpoint. Expected ViT-B/14 style keys, "
-            "possibly with prefixes like module/model/backbone/student/teacher."
-        )
-
-    return best_state, best_name
-
-
-def _create_fallback_model(model_name: str) -> torch.nn.Module:
+def _create_pretrained_model(model_name: str, *, features_only: bool = False) -> torch.nn.Module:
+    kwargs: dict[str, Any] = {"pretrained": True}
+    if features_only:
+        kwargs["features_only"] = True
+        kwargs["out_indices"] = (1, 2, 3)
     try:
-        model = create_model(model_name, pretrained=True, dynamic_img_size=True)
+        kwargs["dynamic_img_size"] = True
+        return create_model(model_name, **kwargs)
     except TypeError:
-        model = create_model(model_name, pretrained=True)
-    return model
+        kwargs.pop("dynamic_img_size", None)
+        return create_model(model_name, **kwargs)
 
 
 def _validate_supported_model_name(model_name: str) -> None:
     if model_name not in SUPPORTED_BACKBONE_MODELS:
         supported = ", ".join(SUPPORTED_BACKBONE_MODELS)
-        raise ValueError(
-            f"Unsupported model '{model_name}'. Supported models: {supported}"
-        )
+        raise ValueError(f"Unsupported model '{model_name}'. Supported models: {supported}")
 
 
-def _create_backbone_base_model(model_name: str) -> torch.nn.Module:
-    try:
-        return create_model(model_name, pretrained=False, dynamic_img_size=True)
-    except TypeError:
-        return create_model(model_name, pretrained=False)
-
-
-def load_backbone(cfg: PoCConfig, device: torch.device) -> DINOv2BackboneWrapper:
+def load_backbone(cfg: PoCConfig, device: torch.device) -> torch.nn.Module:
     _validate_supported_model_name(cfg.backbone_model_name)
-    _validate_supported_model_name(cfg.fallback_model_name)
+    print(f"Loading pretrained backbone: {cfg.backbone_model_name}")
 
-    checkpoint_path = Path(cfg.checkpoint_path)
-    model = _create_backbone_base_model(cfg.backbone_model_name)
-
-    if checkpoint_path.exists():
-        raw = torch.load(checkpoint_path, map_location="cpu")
-        try:
-            prepared_state, src_name = _prepare_checkpoint_state_dict(raw, model)
-            missing, unexpected = model.load_state_dict(prepared_state, strict=False)
-            print(f"Loaded ADPretrain checkpoint: {checkpoint_path}")
-            print(f"State dict source: {src_name}, loaded keys: {len(prepared_state)}")
-            if missing:
-                print(f"Missing keys ({len(missing)}), first 5: {missing[:5]}")
-            if unexpected:
-                print(f"Unexpected keys ({len(unexpected)}), first 5: {unexpected[:5]}")
-        except Exception as exc:
-            if not cfg.allow_backbone_fallback:
-                raise RuntimeError(
-                    "Failed to load ADPretrain checkpoint. "
-                    "Please verify that the file matches --backbone-model-name. "
-                    "To continue anyway, set --allow-backbone-fallback.\n"
-                    f"Details: {exc}"
-                ) from exc
-            print(f"ADPretrain checkpoint is incompatible: {exc}")
-            print(f"Falling back to pretrained timm model: {cfg.fallback_model_name}")
-            model = _create_fallback_model(cfg.fallback_model_name)
-    elif cfg.allow_backbone_fallback:
-        print(f"ADPretrain checkpoint not found. Falling back to pretrained timm model: {cfg.fallback_model_name}")
-        model = _create_fallback_model(cfg.fallback_model_name)
+    if cfg.backbone_model_name.startswith("vit_"):
+        model = _create_pretrained_model(cfg.backbone_model_name, features_only=False)
+        if hasattr(model, "patch_embed") and hasattr(model.patch_embed, "strict_img_size"):
+            model.patch_embed.strict_img_size = False
+        wrapped: torch.nn.Module = DINOv2BackboneWrapper(model, cfg.layers)
     else:
-        raise FileNotFoundError(
-            "ADPretrain checkpoint missing. Please place the official ADPretrain DINOv2-base"
-            f" checkpoint at: {checkpoint_path}.\n"
-            "Set allow_backbone_fallback=True only if you explicitly want fallback pretrained weights."
-        )
+        model = _create_pretrained_model(cfg.backbone_model_name, features_only=True)
+        wrapped = TimmFeaturesBackboneWrapper(model)
 
-    if hasattr(model, "patch_embed") and hasattr(model.patch_embed, "strict_img_size"):
-        model.patch_embed.strict_img_size = False
-
-    model.eval().to(device)
-    for p in model.parameters():
+    wrapped.eval().to(device)
+    for p in wrapped.parameters():
         p.requires_grad = False
-    return DINOv2BackboneWrapper(model, cfg.layers)
-
-
-def ensure_backbone_ready(cfg: PoCConfig) -> None:
-    checkpoint_path = Path(cfg.checkpoint_path)
-    if checkpoint_path.exists() or cfg.allow_backbone_fallback:
-        return
-
-    raise FileNotFoundError(
-        "ADPretrain checkpoint missing. Please place the official ADPretrain DINOv2-base"
-        f" checkpoint at: {checkpoint_path}.\n"
-        "If you want a quick PoC run without ADPretrain weights, rerun with:"
-        " --allow-backbone-fallback (optional: --fallback-model-name <timm_model>)"
-    )
+    return wrapped
 
 
 def evaluate(
@@ -677,7 +573,6 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
     t_all = time.perf_counter()
     set_seed(cfg.seed)
     setup_project_dirs(cfg)
-    ensure_backbone_ready(cfg)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -742,8 +637,7 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="MVTec AD metal_nut PoC (ADPretrain DINOv2-base)")
-    parser.add_argument("--allow-backbone-fallback", action="store_true")
+    parser = argparse.ArgumentParser(description="MVTec AD metal_nut PoC (pretrained timm backbones)")
     parser.add_argument("--feature-size-factor", type=float, default=0.75)
     parser.add_argument("--num-prototypes", type=int, default=256)
     parser.add_argument("--pca-dim", type=int, default=128)
@@ -753,14 +647,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="vit_base_patch14_dinov2.lvd142m",
         choices=SUPPORTED_BACKBONE_MODELS,
-        help="Backbone architecture used for ADPretrain checkpoint loading.",
-    )
-    parser.add_argument(
-        "--fallback-model-name",
-        type=str,
-        default="vit_base_patch14_dinov2.lvd142m",
-        choices=SUPPORTED_BACKBONE_MODELS,
-        help="timm model name used when --allow-backbone-fallback is enabled.",
+        help="Pretrained timm backbone model name.",
     )
     parser.add_argument(
         "--num-visualization-examples",
@@ -774,21 +661,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     cfg = PoCConfig(
-        allow_backbone_fallback=args.allow_backbone_fallback,
         backbone_model_name=args.backbone_model_name,
         feature_size_factor=args.feature_size_factor,
         num_prototypes=args.num_prototypes,
         pca_dim=args.pca_dim,
         distance_type=args.distance_type,
-        fallback_model_name=args.fallback_model_name,
         num_visualization_examples=args.num_visualization_examples,
     )
-    try:
-        run_poc(cfg)
-    except FileNotFoundError as exc:
-        print("\n[ERROR] Setup incomplete:\n")
-        print(str(exc))
-        raise
+    run_poc(cfg)
 
 
 if __name__ == "__main__":
