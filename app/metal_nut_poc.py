@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import random
 import shutil
@@ -274,28 +275,216 @@ class PrototypeAnomalyModel:
         self.mahalanobis_vars = reg_var
         self.mahalanobis_global_var = global_var
 
+    def _build_cache_hash(self, dataset: MVTecMetalNutDataset) -> str:
+        payload = {
+            "backbone_model_name": self.cfg.backbone_model_name,
+            "feature_size_factor": self.cfg.feature_size_factor,
+            "pca_dim": self.cfg.pca_dim,
+            "category": self.cfg.category,
+            "file_list": [str(p) for p in dataset.samples],
+        }
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+        return digest[:16]
+
+    def _cache_paths(self, dataset: MVTecMetalNutDataset) -> tuple[Path, Path]:
+        cache_dir = Path(self.cfg.project_root) / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_hash = self._build_cache_hash(dataset)
+        return cache_dir / f"train_feats_{cache_hash}.npz", cache_dir / f"train_feats_pca_{cache_hash}.npz"
+
+    @staticmethod
+    def _validate_block_cache(
+        all_feats: np.ndarray,
+        block_sizes: np.ndarray,
+        expected_count: int,
+        expected_dim: int | None = None,
+    ) -> bool:
+        if not isinstance(all_feats, np.ndarray) or all_feats.ndim != 2:
+            return False
+        if not np.issubdtype(all_feats.dtype, np.floating):
+            return False
+        if expected_dim is not None and all_feats.shape[1] != expected_dim:
+            return False
+        if not isinstance(block_sizes, np.ndarray) or block_sizes.ndim != 1:
+            return False
+        if block_sizes.shape[0] != expected_count:
+            return False
+        if not np.issubdtype(block_sizes.dtype, np.integer):
+            return False
+        if np.any(block_sizes <= 0):
+            return False
+        if int(np.sum(block_sizes)) != int(all_feats.shape[0]):
+            return False
+        return True
+
+    @staticmethod
+    def _validate_paths(paths: np.ndarray, expected_paths: list[str]) -> bool:
+        if not isinstance(paths, np.ndarray) or paths.ndim != 1:
+            return False
+        cached = [str(p) for p in paths.tolist()]
+        return cached == expected_paths
+
+    def _load_raw_feature_cache(
+        self,
+        cache_path: Path,
+        expected_paths: list[str],
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        if not cache_path.exists():
+            return None
+        try:
+            with np.load(cache_path, allow_pickle=False) as payload:
+                all_train_feats = payload["all_train_feats"]
+                block_sizes = payload["block_sizes"]
+                paths = payload["paths"]
+        except Exception as exc:
+            print(f"[WARN] Failed loading raw feature cache {cache_path}: {exc}")
+            return None
+
+        if not self._validate_paths(paths, expected_paths):
+            print(f"[WARN] Raw cache path list mismatch in {cache_path}. Recomputing.")
+            return None
+        if not self._validate_block_cache(all_train_feats, block_sizes, expected_count=len(expected_paths)):
+            print(f"[WARN] Raw cache shape/type invalid in {cache_path}. Recomputing.")
+            return None
+        print(f"Using raw train feature cache: {cache_path}")
+        return all_train_feats.astype(np.float32, copy=False), block_sizes.astype(np.int64, copy=False)
+
+    def _save_raw_feature_cache(
+        self,
+        cache_path: Path,
+        all_train_feats: np.ndarray,
+        block_sizes: np.ndarray,
+        paths: list[str],
+    ) -> None:
+        np.savez_compressed(
+            cache_path,
+            all_train_feats=all_train_feats.astype(np.float32),
+            block_sizes=block_sizes.astype(np.int64),
+            paths=np.array(paths, dtype="<U512"),
+        )
+
+    def _load_pca_feature_cache(
+        self,
+        cache_path: Path,
+        expected_paths: list[str],
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        if not cache_path.exists():
+            return None
+        try:
+            with np.load(cache_path, allow_pickle=False) as payload:
+                all_train_red = payload["all_train_red"]
+                block_sizes = payload["block_sizes"]
+                paths = payload["paths"]
+                pca_components = payload["pca_components"]
+                pca_mean = payload["pca_mean"]
+                pca_explained_variance = payload["pca_explained_variance"]
+                pca_explained_variance_ratio = payload["pca_explained_variance_ratio"]
+                pca_singular_values = payload["pca_singular_values"]
+                pca_noise_variance = payload["pca_noise_variance"]
+                pca_n_features_in = payload["pca_n_features_in"]
+                pca_n_samples_seen = payload["pca_n_samples_seen"]
+        except Exception as exc:
+            print(f"[WARN] Failed loading PCA cache {cache_path}: {exc}")
+            return None
+
+        if not self._validate_paths(paths, expected_paths):
+            print(f"[WARN] PCA cache path list mismatch in {cache_path}. Recomputing.")
+            return None
+        if not self._validate_block_cache(
+            all_train_red,
+            block_sizes,
+            expected_count=len(expected_paths),
+            expected_dim=self.cfg.pca_dim,
+        ):
+            print(f"[WARN] PCA cache reduced feature shape/type invalid in {cache_path}. Recomputing.")
+            return None
+
+        if (
+            pca_components.ndim != 2
+            or pca_components.shape[0] != self.cfg.pca_dim
+            or pca_mean.ndim != 1
+            or pca_components.shape[1] != pca_mean.shape[0]
+            or pca_explained_variance.shape != (self.cfg.pca_dim,)
+            or pca_explained_variance_ratio.shape != (self.cfg.pca_dim,)
+            or pca_singular_values.shape != (self.cfg.pca_dim,)
+            or np.asarray(pca_n_features_in).ndim != 0
+            or np.asarray(pca_n_samples_seen).ndim != 0
+        ):
+            print(f"[WARN] PCA cache metadata invalid in {cache_path}. Recomputing.")
+            return None
+
+        pca = PCA(n_components=self.cfg.pca_dim, random_state=self.cfg.seed)
+        pca.components_ = pca_components.astype(np.float32)
+        pca.mean_ = pca_mean.astype(np.float32)
+        pca.explained_variance_ = pca_explained_variance.astype(np.float32)
+        pca.explained_variance_ratio_ = pca_explained_variance_ratio.astype(np.float32)
+        pca.singular_values_ = pca_singular_values.astype(np.float32)
+        pca.noise_variance_ = float(np.asarray(pca_noise_variance).item())
+        pca.n_features_in_ = int(np.asarray(pca_n_features_in).item())
+        pca.n_samples_seen_ = int(np.asarray(pca_n_samples_seen).item())
+
+        self.pca = pca
+        print(f"Using PCA/reduced feature cache: {cache_path}")
+        return all_train_red.astype(np.float32, copy=False), block_sizes.astype(np.int64, copy=False)
+
+    def _save_pca_feature_cache(
+        self,
+        cache_path: Path,
+        all_train_red: np.ndarray,
+        block_sizes: np.ndarray,
+        paths: list[str],
+    ) -> None:
+        if self.pca is None:
+            raise RuntimeError("PCA must be fitted before saving PCA cache.")
+        np.savez_compressed(
+            cache_path,
+            all_train_red=all_train_red.astype(np.float32),
+            block_sizes=block_sizes.astype(np.int64),
+            paths=np.array(paths, dtype="<U512"),
+            pca_components=self.pca.components_.astype(np.float32),
+            pca_mean=self.pca.mean_.astype(np.float32),
+            pca_explained_variance=self.pca.explained_variance_.astype(np.float32),
+            pca_explained_variance_ratio=self.pca.explained_variance_ratio_.astype(np.float32),
+            pca_singular_values=self.pca.singular_values_.astype(np.float32),
+            pca_noise_variance=np.array(self.pca.noise_variance_, dtype=np.float32),
+            pca_n_features_in=np.array(self.pca.n_features_in_, dtype=np.int64),
+            pca_n_samples_seen=np.array(self.pca.n_samples_seen_, dtype=np.int64),
+        )
+
     def fit(self, dataset: MVTecMetalNutDataset, extractor: FeatureExtractor) -> None:
-        train_feature_blocks: list[np.ndarray] = []
-        for sample in tqdm(dataset.samples, desc="Collect features for PCA"):
-            image = Image.open(sample).convert("RGB")
-            feats, _, _ = extractor.extract_patch_features(image)
-            train_feature_blocks.append(feats)
+        sample_paths = [str(p) for p in dataset.samples]
+        raw_cache_path, pca_cache_path = self._cache_paths(dataset)
 
-        all_train_feats = np.concatenate(train_feature_blocks, axis=0)
-        pca_fit_feats = all_train_feats
-        if all_train_feats.shape[0] > self.cfg.max_pca_samples:
-            idx = np.random.choice(all_train_feats.shape[0], self.cfg.max_pca_samples, replace=False)
-            pca_fit_feats = all_train_feats[idx]
+        pca_cached = self._load_pca_feature_cache(pca_cache_path, sample_paths)
+        if pca_cached is not None:
+            all_train_red, _ = pca_cached
+        else:
+            raw_cached = self._load_raw_feature_cache(raw_cache_path, sample_paths)
+            if raw_cached is None:
+                train_feature_blocks: list[np.ndarray] = []
+                for sample in tqdm(dataset.samples, desc="Collect features for PCA"):
+                    image = Image.open(sample).convert("RGB")
+                    feats, _, _ = extractor.extract_patch_features(image)
+                    train_feature_blocks.append(feats.astype(np.float32))
 
-        self.pca = PCA(n_components=self.cfg.pca_dim, random_state=self.cfg.seed)
-        self.pca.fit(pca_fit_feats)
+                block_sizes = np.array([x.shape[0] for x in train_feature_blocks], dtype=np.int64)
+                all_train_feats = np.concatenate(train_feature_blocks, axis=0).astype(np.float32)
+                self._save_raw_feature_cache(raw_cache_path, all_train_feats, block_sizes, sample_paths)
+                print(f"Saved raw train feature cache: {raw_cache_path}")
+            else:
+                all_train_feats, block_sizes = raw_cached
 
-        reduced_train_feats = [
-            self.pca.transform(feats).astype(np.float32)
-            for feats in tqdm(train_feature_blocks, desc="Fit prototypes")
-        ]
+            pca_fit_feats = all_train_feats
+            if all_train_feats.shape[0] > self.cfg.max_pca_samples:
+                idx = np.random.choice(all_train_feats.shape[0], self.cfg.max_pca_samples, replace=False)
+                pca_fit_feats = all_train_feats[idx]
 
-        all_train_red = np.concatenate(reduced_train_feats, axis=0)
+            self.pca = PCA(n_components=self.cfg.pca_dim, random_state=self.cfg.seed)
+            self.pca.fit(pca_fit_feats)
+            all_train_red = self.pca.transform(all_train_feats).astype(np.float32)
+            self._save_pca_feature_cache(pca_cache_path, all_train_red, block_sizes, sample_paths)
+            print(f"Saved PCA/reduced feature cache: {pca_cache_path}")
+
         effective_clusters = self._resolve_num_clusters(self.cfg.num_prototypes, all_train_red.shape[0])
         if effective_clusters != self.cfg.num_prototypes:
             print(
