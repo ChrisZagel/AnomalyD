@@ -1,1 +1,10 @@
-rich==13.9.4
+torch
+torchvision
+timm
+scikit-learn
+numpy
+pillow
+matplotlib
+tqdm
+opencv-python-headless
+scipy
