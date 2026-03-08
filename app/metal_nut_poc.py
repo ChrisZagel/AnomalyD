@@ -135,17 +135,22 @@ class DINOv2BackboneWrapper(torch.nn.Module):
         _ = self.model.forward_features(x)
         token_h = x.shape[-2] // self.model.patch_embed.patch_size[0]
         token_w = x.shape[-1] // self.model.patch_embed.patch_size[1]
+        expected_tokens = token_h * token_w
         maps = []
         for idx in self.layers:
             tokens = self._hook_outputs[idx]
             if tokens.dim() != 3:
                 raise RuntimeError(f"Unexpected token shape at layer {idx}: {tokens.shape}")
-            if tokens.shape[1] == token_h * token_w + 1:
-                tokens = tokens[:, 1:, :]
-            if tokens.shape[1] != token_h * token_w:
+
+            # Keep only spatial patch tokens.
+            # DINOv2 variants may prepend CLS and optional register tokens.
+            if tokens.shape[1] > expected_tokens:
+                tokens = tokens[:, -expected_tokens:, :]
+
+            if tokens.shape[1] != expected_tokens:
                 raise RuntimeError(
                     f"Cannot reshape tokens from layer {idx}. Got {tokens.shape[1]} tokens,"
-                    f" expected {token_h * token_w}."
+                    f" expected {expected_tokens}."
                 )
             fmap = tokens.reshape(tokens.shape[0], token_h, token_w, tokens.shape[-1]).permute(0, 3, 1, 2)
             maps.append(fmap)
@@ -388,13 +393,15 @@ def _create_pretrained_model(model_name: str, *, features_only: bool = False) ->
     kwargs: dict[str, Any] = {"pretrained": True}
     if features_only:
         kwargs["features_only"] = True
-        kwargs["out_indices"] = (1, 2, 3)
-    try:
-        kwargs["dynamic_img_size"] = True
-        return create_model(model_name, **kwargs)
-    except TypeError:
-        kwargs.pop("dynamic_img_size", None)
-        return create_model(model_name, **kwargs)
+
+    # dynamic_img_size is only needed for ViT-style patch models.
+    if model_name.startswith("vit_"):
+        try:
+            return create_model(model_name, dynamic_img_size=True, **kwargs)
+        except TypeError:
+            return create_model(model_name, **kwargs)
+
+    return create_model(model_name, **kwargs)
 
 
 def _validate_supported_model_name(model_name: str) -> None:
