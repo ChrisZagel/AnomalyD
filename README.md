@@ -123,3 +123,53 @@ Nach erfolgreichem Lauf:
 - Mehr Kategorien neben `metal_nut` unterstützen.
 - Feature-Sampling/Streaming weiter optimieren für sehr große Sets.
 - Alternative Prototypenmodelle (z. B. GMM, kNN-Memory) als Vergleich.
+
+
+## Unterstützte Backbone-Namen
+
+Folgende Modelle werden jetzt explizit unterstützt (für `--backbone-model-name` und `--fallback-model-name`):
+
+- `vit_base_patch14_dinov2.lvd142m`
+- `vit_base_patch14_reg4_dinov2.lvd142m`
+- `vit_small_patch14_dinov2.lvd142m`
+- `vit_small_patch14_reg4_dinov2.lvd142m`
+- `vit_base_patch16_224.dino`
+- `vit_small_patch16_224.dino`
+
+Beispiele:
+
+```bash
+python main.py --allow-backbone-fallback --fallback-model-name vit_small_patch14_dinov2.lvd142m
+python main.py --allow-backbone-fallback --fallback-model-name vit_base_patch16_224.dino
+```
+
+Wenn du einen ADPretrain-Checkpoint für ein anderes Backbone hast, setze zusätzlich:
+
+```bash
+python main.py --backbone-model-name vit_small_patch14_reg4_dinov2.lvd142m
+```
+
+Dieser Fallback ist bewusst **nicht** stillschweigend aktiv.
+
+Hinweis: Der ADPretrain-Loader akzeptiert auch häufige Checkpoint-Container/Prefixe (z. B. `state_dict`, `model`, `backbone`, `student`, `teacher`, `module`) und mappt kompatible DINOv2-Base-Keys automatisch.
+
+---
+
+## Outputs
+
+Nach erfolgreichem Lauf:
+
+- Modellartefakte: `/content/project/outputs/models/prototype_model.pkl`
+- Metriken: `/content/project/outputs/metrics.json` und `metrics.csv`
+- Per-Sample-Report: `/content/project/outputs/per_sample_report.csv`
+- Visualisierungen: `/content/project/outputs/visualizations/*.png`
+- Finale 5er-Overlay-Galerie (Falschfarbe): `/content/project/outputs/visualizations/final_top5_overlay_gallery.png`
+
+---
+
+## Mögliche spätere Erweiterungen
+
+- AUPRO/PRO-Metrik ergänzen.
+- Mehr Kategorien neben `metal_nut` unterstützen.
+- Feature-Sampling/Streaming weiter optimieren für sehr große Sets.
+- Alternative Prototypenmodelle (z. B. GMM, kNN-Memory) als Vergleich.

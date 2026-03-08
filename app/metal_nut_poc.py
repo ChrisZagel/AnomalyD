@@ -26,6 +26,16 @@ from timm import create_model
 from tqdm.auto import tqdm
 
 
+SUPPORTED_BACKBONE_MODELS: tuple[str, ...] = (
+    "vit_base_patch14_dinov2.lvd142m",
+    "vit_base_patch14_reg4_dinov2.lvd142m",
+    "vit_small_patch14_dinov2.lvd142m",
+    "vit_small_patch14_reg4_dinov2.lvd142m",
+    "vit_base_patch16_224.dino",
+    "vit_small_patch16_224.dino",
+)
+
+
 @dataclass
 class PoCConfig:
     seed: int = 42
@@ -40,6 +50,7 @@ class PoCConfig:
     project_root: str = "/content/project"
     checkpoint_path: str = "/content/project/checkpoints/adpretrain_dinov2_base.pth"
     allow_backbone_fallback: bool = False
+    backbone_model_name: str = "vit_base_patch14_dinov2.lvd142m"
     fallback_model_name: str = "vit_base_patch14_dinov2.lvd142m"
     feature_size_factor: float = 0.75
     num_prototypes: int = 256
@@ -439,9 +450,27 @@ def _create_fallback_model(model_name: str) -> torch.nn.Module:
     return model
 
 
+def _validate_supported_model_name(model_name: str) -> None:
+    if model_name not in SUPPORTED_BACKBONE_MODELS:
+        supported = ", ".join(SUPPORTED_BACKBONE_MODELS)
+        raise ValueError(
+            f"Unsupported model '{model_name}'. Supported models: {supported}"
+        )
+
+
+def _create_backbone_base_model(model_name: str) -> torch.nn.Module:
+    try:
+        return create_model(model_name, pretrained=False, dynamic_img_size=True)
+    except TypeError:
+        return create_model(model_name, pretrained=False)
+
+
 def load_backbone(cfg: PoCConfig, device: torch.device) -> DINOv2BackboneWrapper:
+    _validate_supported_model_name(cfg.backbone_model_name)
+    _validate_supported_model_name(cfg.fallback_model_name)
+
     checkpoint_path = Path(cfg.checkpoint_path)
-    model = create_model("vit_base_patch14_dinov2.lvd142m", pretrained=False, dynamic_img_size=True)
+    model = _create_backbone_base_model(cfg.backbone_model_name)
 
     if checkpoint_path.exists():
         raw = torch.load(checkpoint_path, map_location="cpu")
@@ -458,7 +487,7 @@ def load_backbone(cfg: PoCConfig, device: torch.device) -> DINOv2BackboneWrapper
             if not cfg.allow_backbone_fallback:
                 raise RuntimeError(
                     "Failed to load ADPretrain checkpoint. "
-                    "Please verify that the file is a DINOv2-base style checkpoint. "
+                    "Please verify that the file matches --backbone-model-name. "
                     "To continue anyway, set --allow-backbone-fallback.\n"
                     f"Details: {exc}"
                 ) from exc
@@ -720,9 +749,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pca-dim", type=int, default=128)
     parser.add_argument("--distance-type", type=str, default="cosine", choices=["cosine", "l2"])
     parser.add_argument(
+        "--backbone-model-name",
+        type=str,
+        default="vit_base_patch14_dinov2.lvd142m",
+        choices=SUPPORTED_BACKBONE_MODELS,
+        help="Backbone architecture used for ADPretrain checkpoint loading.",
+    )
+    parser.add_argument(
         "--fallback-model-name",
         type=str,
         default="vit_base_patch14_dinov2.lvd142m",
+        choices=SUPPORTED_BACKBONE_MODELS,
         help="timm model name used when --allow-backbone-fallback is enabled.",
     )
     parser.add_argument(
@@ -738,6 +775,7 @@ def main() -> None:
     args = parse_args()
     cfg = PoCConfig(
         allow_backbone_fallback=args.allow_backbone_fallback,
+        backbone_model_name=args.backbone_model_name,
         feature_size_factor=args.feature_size_factor,
         num_prototypes=args.num_prototypes,
         pca_dim=args.pca_dim,
