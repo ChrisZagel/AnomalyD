@@ -359,7 +359,7 @@ def ensure_dataset(cfg: PoCConfig) -> Path:
 
 def load_backbone(cfg: PoCConfig, device: torch.device) -> DINOv2BackboneWrapper:
     checkpoint_path = Path(cfg.checkpoint_path)
-    model = create_model("vit_base_patch14_dinov2.lvd142m", pretrained=False)
+    model = create_model("vit_base_patch14_dinov2.lvd142m", pretrained=False, dynamic_img_size=True)
 
     if checkpoint_path.exists():
         raw = torch.load(checkpoint_path, map_location="cpu")
@@ -373,13 +373,16 @@ def load_backbone(cfg: PoCConfig, device: torch.device) -> DINOv2BackboneWrapper
             print(f"Unexpected keys ({len(unexpected)}), first 5: {unexpected[:5]}")
     elif cfg.allow_backbone_fallback:
         print("ADPretrain checkpoint not found. Falling back to vanilla DINOv2-base weights.")
-        model = create_model("vit_base_patch14_dinov2.lvd142m", pretrained=True)
+        model = create_model("vit_base_patch14_dinov2.lvd142m", pretrained=True, dynamic_img_size=True)
     else:
         raise FileNotFoundError(
             "ADPretrain checkpoint missing. Please place the official ADPretrain DINOv2-base"
             f" checkpoint at: {checkpoint_path}.\n"
             "Set allow_backbone_fallback=True only if you explicitly want vanilla DINOv2-base fallback."
         )
+
+    if hasattr(model, "patch_embed") and hasattr(model.patch_embed, "strict_img_size"):
+        model.patch_embed.strict_img_size = False
 
     model.eval().to(device)
     for p in model.parameters():
