@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import random
 import shutil
@@ -24,7 +23,6 @@ from sklearn.cluster import MiniBatchKMeans
 from sklearn.decomposition import PCA
 from sklearn.metrics import precision_recall_curve, precision_recall_fscore_support, roc_auc_score
 from timm import create_model
-from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 
@@ -190,30 +188,9 @@ class FeatureExtractor:
             ]
         )
 
-    def _collate_samples(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
-        tensors = [self.transform(sample["image"]) for sample in samples]
-        images = torch.stack(tensors, dim=0)
-        return {
-            "images": images,
-            "samples": samples,
-        }
-
-    def create_dataloader(self, dataset: MVTecMetalNutDataset) -> DataLoader:
-        return DataLoader(
-            dataset,
-            batch_size=self.cfg.batch_size,
-            shuffle=False,
-            num_workers=max(0, self.cfg.num_workers),
-            pin_memory=self.device.type == "cuda",
-            collate_fn=self._collate_samples,
-        )
-
     @torch.no_grad()
-    def extract_patch_features_batch(
-        self,
-        images: torch.Tensor,
-    ) -> tuple[list[np.ndarray], tuple[int, int], tuple[int, int]]:
-        tensor = images.to(self.device, non_blocking=True)
+    def extract_patch_features(self, image: Image.Image) -> tuple[np.ndarray, tuple[int, int], tuple[int, int]]:
+        tensor = self.transform(image).unsqueeze(0).to(self.device)
         orig_h, orig_w = tensor.shape[-2:]
         if self.cfg.feature_size_factor != 1.0:
             work_h = max(14, int(round(orig_h * self.cfg.feature_size_factor / 14) * 14))
@@ -234,14 +211,8 @@ class FeatureExtractor:
 
         fused = torch.cat(norm_maps, dim=1)
         b, c, h, w = fused.shape
-        patch_feats = fused.permute(0, 2, 3, 1).reshape(b, h * w, c)
-        patch_feat_blocks = [patch_feats[i].cpu().numpy() for i in range(b)]
-        return patch_feat_blocks, (h, w), (work_h, work_w)
-
-    @torch.no_grad()
-    def extract_patch_features(self, image: Image.Image) -> tuple[np.ndarray, tuple[int, int], tuple[int, int]]:
-        batch_feats, grid_hw, work_hw = self.extract_patch_features_batch(self.transform(image).unsqueeze(0))
-        return batch_feats[0], grid_hw, work_hw
+        patch_feats = fused.permute(0, 2, 3, 1).reshape(b * h * w, c)
+        return patch_feats.cpu().numpy(), (h, w), (work_h, work_w)
 
 
 class PrototypeAnomalyModel:
@@ -303,216 +274,29 @@ class PrototypeAnomalyModel:
         self.mahalanobis_vars = reg_var
         self.mahalanobis_global_var = global_var
 
-    def _build_cache_hash(self, dataset: MVTecMetalNutDataset) -> str:
-        payload = {
-            "backbone_model_name": self.cfg.backbone_model_name,
-            "feature_size_factor": self.cfg.feature_size_factor,
-            "pca_dim": self.cfg.pca_dim,
-            "category": self.cfg.category,
-            "file_list": [str(p) for p in dataset.samples],
-        }
-        digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
-        return digest[:16]
-
-    def _cache_paths(self, dataset: MVTecMetalNutDataset) -> tuple[Path, Path]:
-        cache_dir = Path(self.cfg.project_root) / "cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_hash = self._build_cache_hash(dataset)
-        return cache_dir / f"train_feats_{cache_hash}.npz", cache_dir / f"train_feats_pca_{cache_hash}.npz"
-
-    @staticmethod
-    def _validate_block_cache(
-        all_feats: np.ndarray,
-        block_sizes: np.ndarray,
-        expected_count: int,
-        expected_dim: int | None = None,
-    ) -> bool:
-        if not isinstance(all_feats, np.ndarray) or all_feats.ndim != 2:
-            return False
-        if not np.issubdtype(all_feats.dtype, np.floating):
-            return False
-        if expected_dim is not None and all_feats.shape[1] != expected_dim:
-            return False
-        if not isinstance(block_sizes, np.ndarray) or block_sizes.ndim != 1:
-            return False
-        if block_sizes.shape[0] != expected_count:
-            return False
-        if not np.issubdtype(block_sizes.dtype, np.integer):
-            return False
-        if np.any(block_sizes <= 0):
-            return False
-        if int(np.sum(block_sizes)) != int(all_feats.shape[0]):
-            return False
-        return True
-
-    @staticmethod
-    def _validate_paths(paths: np.ndarray, expected_paths: list[str]) -> bool:
-        if not isinstance(paths, np.ndarray) or paths.ndim != 1:
-            return False
-        cached = [str(p) for p in paths.tolist()]
-        return cached == expected_paths
-
-    def _load_raw_feature_cache(
-        self,
-        cache_path: Path,
-        expected_paths: list[str],
-    ) -> tuple[np.ndarray, np.ndarray] | None:
-        if not cache_path.exists():
-            return None
-        try:
-            with np.load(cache_path, allow_pickle=False) as payload:
-                all_train_feats = payload["all_train_feats"]
-                block_sizes = payload["block_sizes"]
-                paths = payload["paths"]
-        except Exception as exc:
-            print(f"[WARN] Failed loading raw feature cache {cache_path}: {exc}")
-            return None
-
-        if not self._validate_paths(paths, expected_paths):
-            print(f"[WARN] Raw cache path list mismatch in {cache_path}. Recomputing.")
-            return None
-        if not self._validate_block_cache(all_train_feats, block_sizes, expected_count=len(expected_paths)):
-            print(f"[WARN] Raw cache shape/type invalid in {cache_path}. Recomputing.")
-            return None
-        print(f"Using raw train feature cache: {cache_path}")
-        return all_train_feats.astype(np.float32, copy=False), block_sizes.astype(np.int64, copy=False)
-
-    def _save_raw_feature_cache(
-        self,
-        cache_path: Path,
-        all_train_feats: np.ndarray,
-        block_sizes: np.ndarray,
-        paths: list[str],
-    ) -> None:
-        np.savez_compressed(
-            cache_path,
-            all_train_feats=all_train_feats.astype(np.float32),
-            block_sizes=block_sizes.astype(np.int64),
-            paths=np.array(paths, dtype="<U512"),
-        )
-
-    def _load_pca_feature_cache(
-        self,
-        cache_path: Path,
-        expected_paths: list[str],
-    ) -> tuple[np.ndarray, np.ndarray] | None:
-        if not cache_path.exists():
-            return None
-        try:
-            with np.load(cache_path, allow_pickle=False) as payload:
-                all_train_red = payload["all_train_red"]
-                block_sizes = payload["block_sizes"]
-                paths = payload["paths"]
-                pca_components = payload["pca_components"]
-                pca_mean = payload["pca_mean"]
-                pca_explained_variance = payload["pca_explained_variance"]
-                pca_explained_variance_ratio = payload["pca_explained_variance_ratio"]
-                pca_singular_values = payload["pca_singular_values"]
-                pca_noise_variance = payload["pca_noise_variance"]
-                pca_n_features_in = payload["pca_n_features_in"]
-                pca_n_samples_seen = payload["pca_n_samples_seen"]
-        except Exception as exc:
-            print(f"[WARN] Failed loading PCA cache {cache_path}: {exc}")
-            return None
-
-        if not self._validate_paths(paths, expected_paths):
-            print(f"[WARN] PCA cache path list mismatch in {cache_path}. Recomputing.")
-            return None
-        if not self._validate_block_cache(
-            all_train_red,
-            block_sizes,
-            expected_count=len(expected_paths),
-            expected_dim=self.cfg.pca_dim,
-        ):
-            print(f"[WARN] PCA cache reduced feature shape/type invalid in {cache_path}. Recomputing.")
-            return None
-
-        if (
-            pca_components.ndim != 2
-            or pca_components.shape[0] != self.cfg.pca_dim
-            or pca_mean.ndim != 1
-            or pca_components.shape[1] != pca_mean.shape[0]
-            or pca_explained_variance.shape != (self.cfg.pca_dim,)
-            or pca_explained_variance_ratio.shape != (self.cfg.pca_dim,)
-            or pca_singular_values.shape != (self.cfg.pca_dim,)
-            or np.asarray(pca_n_features_in).ndim != 0
-            or np.asarray(pca_n_samples_seen).ndim != 0
-        ):
-            print(f"[WARN] PCA cache metadata invalid in {cache_path}. Recomputing.")
-            return None
-
-        pca = PCA(n_components=self.cfg.pca_dim, random_state=self.cfg.seed)
-        pca.components_ = pca_components.astype(np.float32)
-        pca.mean_ = pca_mean.astype(np.float32)
-        pca.explained_variance_ = pca_explained_variance.astype(np.float32)
-        pca.explained_variance_ratio_ = pca_explained_variance_ratio.astype(np.float32)
-        pca.singular_values_ = pca_singular_values.astype(np.float32)
-        pca.noise_variance_ = float(np.asarray(pca_noise_variance).item())
-        pca.n_features_in_ = int(np.asarray(pca_n_features_in).item())
-        pca.n_samples_seen_ = int(np.asarray(pca_n_samples_seen).item())
-
-        self.pca = pca
-        print(f"Using PCA/reduced feature cache: {cache_path}")
-        return all_train_red.astype(np.float32, copy=False), block_sizes.astype(np.int64, copy=False)
-
-    def _save_pca_feature_cache(
-        self,
-        cache_path: Path,
-        all_train_red: np.ndarray,
-        block_sizes: np.ndarray,
-        paths: list[str],
-    ) -> None:
-        if self.pca is None:
-            raise RuntimeError("PCA must be fitted before saving PCA cache.")
-        np.savez_compressed(
-            cache_path,
-            all_train_red=all_train_red.astype(np.float32),
-            block_sizes=block_sizes.astype(np.int64),
-            paths=np.array(paths, dtype="<U512"),
-            pca_components=self.pca.components_.astype(np.float32),
-            pca_mean=self.pca.mean_.astype(np.float32),
-            pca_explained_variance=self.pca.explained_variance_.astype(np.float32),
-            pca_explained_variance_ratio=self.pca.explained_variance_ratio_.astype(np.float32),
-            pca_singular_values=self.pca.singular_values_.astype(np.float32),
-            pca_noise_variance=np.array(self.pca.noise_variance_, dtype=np.float32),
-            pca_n_features_in=np.array(self.pca.n_features_in_, dtype=np.int64),
-            pca_n_samples_seen=np.array(self.pca.n_samples_seen_, dtype=np.int64),
-        )
-
     def fit(self, dataset: MVTecMetalNutDataset, extractor: FeatureExtractor) -> None:
-        sample_paths = [str(p) for p in dataset.samples]
-        raw_cache_path, pca_cache_path = self._cache_paths(dataset)
+        pca_samples = []
+        for sample in tqdm(dataset.samples, desc="Collect features for PCA"):
+            image = Image.open(sample).convert("RGB")
+            feats, _, _ = extractor.extract_patch_features(image)
+            pca_samples.append(feats)
 
-        pca_cached = self._load_pca_feature_cache(pca_cache_path, sample_paths)
-        if pca_cached is not None:
-            all_train_red, _ = pca_cached
-        else:
-            raw_cached = self._load_raw_feature_cache(raw_cache_path, sample_paths)
-            if raw_cached is None:
-                train_feature_blocks: list[np.ndarray] = []
-                train_loader = extractor.create_dataloader(dataset)
-                for batch in tqdm(train_loader, desc="Collect features for PCA"):
-                    batch_feats, _, _ = extractor.extract_patch_features_batch(batch["images"])
-                    train_feature_blocks.extend(feats.astype(np.float32) for feats in batch_feats)
+        all_feats = np.concatenate(pca_samples, axis=0)
+        if all_feats.shape[0] > self.cfg.max_pca_samples:
+            idx = np.random.choice(all_feats.shape[0], self.cfg.max_pca_samples, replace=False)
+            all_feats = all_feats[idx]
 
-                block_sizes = np.array([x.shape[0] for x in train_feature_blocks], dtype=np.int64)
-                all_train_feats = np.concatenate(train_feature_blocks, axis=0).astype(np.float32)
-                self._save_raw_feature_cache(raw_cache_path, all_train_feats, block_sizes, sample_paths)
-                print(f"Saved raw train feature cache: {raw_cache_path}")
-            else:
-                all_train_feats, block_sizes = raw_cached
+        self.pca = PCA(n_components=self.cfg.pca_dim, random_state=self.cfg.seed)
+        self.pca.fit(all_feats)
 
-            pca_fit_feats = all_train_feats
-            if all_train_feats.shape[0] > self.cfg.max_pca_samples:
-                idx = np.random.choice(all_train_feats.shape[0], self.cfg.max_pca_samples, replace=False)
-                pca_fit_feats = all_train_feats[idx]
+        reduced_train_feats = []
+        for sample in tqdm(dataset.samples, desc="Fit prototypes"):
+            image = Image.open(sample).convert("RGB")
+            feats, _, _ = extractor.extract_patch_features(image)
+            feats_red = self.pca.transform(feats)
+            reduced_train_feats.append(feats_red.astype(np.float32))
 
-            self.pca = PCA(n_components=self.cfg.pca_dim, random_state=self.cfg.seed)
-            self.pca.fit(pca_fit_feats)
-            all_train_red = self.pca.transform(all_train_feats).astype(np.float32)
-            self._save_pca_feature_cache(pca_cache_path, all_train_red, block_sizes, sample_paths)
-            print(f"Saved PCA/reduced feature cache: {pca_cache_path}")
-
+        all_train_red = np.concatenate(reduced_train_feats, axis=0)
         effective_clusters = self._resolve_num_clusters(self.cfg.num_prototypes, all_train_red.shape[0])
         if effective_clusters != self.cfg.num_prototypes:
             print(
@@ -584,16 +368,16 @@ class PrototypeAnomalyModel:
             raise ValueError(f"Unsupported distance_type: {self.cfg.distance_type}")
         return np.concatenate(mins, axis=0)
 
-    def infer_map_from_features(
+    def infer_map(
         self,
-        feats: np.ndarray,
-        grid_hw: tuple[int, int],
-        work_hw: tuple[int, int],
+        image: Image.Image,
+        extractor: FeatureExtractor,
         orig_size: tuple[int, int],
     ) -> tuple[np.ndarray, float]:
         if self.pca is None or self.centers is None:
             raise RuntimeError("Model is not fitted yet.")
 
+        feats, grid_hw, work_hw = extractor.extract_patch_features(image)
         feats_red = self.pca.transform(feats)
         patch_scores = self._chunked_min_distance(feats_red.astype(np.float32), self.centers)
 
@@ -609,15 +393,6 @@ class PrototypeAnomalyModel:
         image_score = float(np.mean(np.partition(full_map.ravel(), -topk)[-topk:]))
         return full_map, image_score
 
-    def infer_map(
-        self,
-        image: Image.Image,
-        extractor: FeatureExtractor,
-        orig_size: tuple[int, int],
-    ) -> tuple[np.ndarray, float]:
-        feats, grid_hw, work_hw = extractor.extract_patch_features(image)
-        return self.infer_map_from_features(feats, grid_hw, work_hw, orig_size)
-
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -625,6 +400,17 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _get_pca_seen_samples(pca_obj: PCA) -> int:
+    """Return number of seen samples for sklearn PCA/IncrementalPCA compatibility."""
+    n_seen = getattr(pca_obj, "n_samples_seen_", None)
+    if n_seen is not None:
+        return int(n_seen)
+    n_samples = getattr(pca_obj, "n_samples_", None)
+    if n_samples is not None:
+        return int(n_samples)
+    return 0
 
 
 def setup_project_dirs(cfg: PoCConfig) -> dict[str, Path]:
@@ -743,63 +529,54 @@ def evaluate(
     extractor: FeatureExtractor,
     proto_model: PrototypeAnomalyModel,
     out_dir: Path,
-) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]], dict[int, np.ndarray]]:
+) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]]]:
     image_labels: list[int] = []
     image_scores: list[float] = []
     pixel_labels: list[np.ndarray] = []
     pixel_scores: list[np.ndarray] = []
     per_sample_rows: list[dict[str, Any]] = []
     per_sample_eval: list[dict[str, Any]] = []
-    anom_maps_by_index: dict[int, np.ndarray] = {}
 
     vis_dir = out_dir / "visualizations"
     vis_dir.mkdir(parents=True, exist_ok=True)
 
     saved_vis = 0
-    sample_idx = 0
-    test_loader = extractor.create_dataloader(test_ds)
-    for batch in tqdm(test_loader, desc="Evaluate test set"):
-        samples = batch["samples"]
+    for idx in tqdm(range(len(test_ds)), desc="Evaluate test set"):
+        sample = test_ds[idx]
         t0 = time.perf_counter()
-        batch_feats, grid_hw, work_hw = extractor.extract_patch_features_batch(batch["images"])
-        batch_infer_sec = time.perf_counter() - t0
+        anom_map, image_score = proto_model.infer_map(sample["image"], extractor, sample["orig_size"])
+        infer_sec = time.perf_counter() - t0
 
-        for sample, feats in zip(samples, batch_feats):
-            anom_map, image_score = proto_model.infer_map_from_features(feats, grid_hw, work_hw, sample["orig_size"])
-            infer_sec = batch_infer_sec / max(1, len(samples))
+        image_labels.append(sample["label"])
+        image_scores.append(image_score)
+        pixel_labels.append(sample["mask"].astype(np.uint8).ravel())
+        pixel_scores.append(anom_map.ravel())
+        per_sample_rows.append(
+            {
+                "index": idx,
+                "path": sample["path"],
+                "defect_type": sample["defect_type"],
+                "label": sample["label"],
+                "image_score": float(image_score),
+                "infer_time_sec": float(infer_sec),
+                "map_mean": float(anom_map.mean()),
+                "map_max": float(anom_map.max()),
+            }
+        )
+        per_sample_eval.append(
+            {
+                "index": idx,
+                "defect_type": sample["defect_type"],
+                "label": sample["label"],
+                "image_score": float(image_score),
+                "mask": sample["mask"].astype(np.uint8),
+                "anom_map": anom_map.astype(np.float32),
+            }
+        )
 
-            image_labels.append(sample["label"])
-            image_scores.append(image_score)
-            pixel_labels.append(sample["mask"].astype(np.uint8).ravel())
-            pixel_scores.append(anom_map.ravel())
-            per_sample_rows.append(
-                {
-                    "index": sample_idx,
-                    "path": sample["path"],
-                    "defect_type": sample["defect_type"],
-                    "label": sample["label"],
-                    "image_score": float(image_score),
-                    "infer_time_sec": float(infer_sec),
-                    "map_mean": float(anom_map.mean()),
-                    "map_max": float(anom_map.max()),
-                }
-            )
-            per_sample_eval.append(
-                {
-                    "index": sample_idx,
-                    "defect_type": sample["defect_type"],
-                    "label": sample["label"],
-                    "image_score": float(image_score),
-                    "mask": sample["mask"].astype(np.uint8),
-                    "anom_map": anom_map.astype(np.float32),
-                }
-            )
-            anom_maps_by_index[sample_idx] = anom_map.astype(np.float32)
-
-            if saved_vis < 8:
-                save_visualization(sample, anom_map, vis_dir / f"sample_{sample_idx:03d}.png")
-                saved_vis += 1
-            sample_idx += 1
+        if saved_vis < 8:
+            save_visualization(sample, anom_map, vis_dir / f"sample_{idx:03d}.png")
+            saved_vis += 1
 
     image_auc = float(roc_auc_score(image_labels, image_scores))
     pixel_auc = float(roc_auc_score(np.concatenate(pixel_labels), np.concatenate(pixel_scores)))
@@ -810,7 +587,7 @@ def evaluate(
         "mean_infer_time_sec": float(np.mean([r["infer_time_sec"] for r in per_sample_rows])),
         "std_infer_time_sec": float(np.std([r["infer_time_sec"] for r in per_sample_rows])),
     }
-    return metrics, per_sample_rows, per_sample_eval, anom_maps_by_index
+    return metrics, per_sample_rows, per_sample_eval
 
 
 def save_per_sample_report(rows: list[dict[str, Any]], out_dir: Path) -> None:
@@ -962,11 +739,10 @@ def save_per_defect_metrics(rows: list[dict[str, Any]], out_dir: Path) -> None:
 def save_overlay_gallery(
     rows: list[dict[str, Any]],
     test_ds: MVTecMetalNutDataset,
-    extractor: FeatureExtractor | None,
-    proto_model: PrototypeAnomalyModel | None,
+    extractor: FeatureExtractor,
+    proto_model: PrototypeAnomalyModel,
     out_path: Path,
     num_examples: int,
-    anom_maps_by_index: dict[int, np.ndarray] | None = None,
 ) -> None:
     if not rows or num_examples <= 0:
         return
@@ -979,12 +755,7 @@ def save_overlay_gallery(
 
     for ax, row in zip(axes, top_rows):
         sample = test_ds[int(row["index"])]
-        index = int(row["index"])
-        anom_map = None if anom_maps_by_index is None else anom_maps_by_index.get(index)
-        if anom_map is None:
-            if proto_model is None or extractor is None:
-                raise ValueError("Missing anomaly map and fallback inference dependencies for overlay gallery.")
-            anom_map, _ = proto_model.infer_map(sample["image"], extractor, sample["orig_size"])
+        anom_map, _ = proto_model.infer_map(sample["image"], extractor, sample["orig_size"])
         image_np = np.array(sample["image"]) / 255.0
         norm = (anom_map - anom_map.min()) / (anom_map.max() - anom_map.min() + 1e-8)
         heat = plt.cm.jet(norm)[..., :3]
@@ -1065,7 +836,7 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
     proto_model.save(output_dir / "models")
 
     t_eval = time.perf_counter()
-    metrics, per_sample_rows, per_sample_eval, anom_maps_by_index = evaluate(test_ds, extractor, proto_model, output_dir)
+    metrics, per_sample_rows, per_sample_eval = evaluate(test_ds, extractor, proto_model, output_dir)
     eval_time = time.perf_counter() - t_eval
     total_time = time.perf_counter() - t_all
 
@@ -1081,6 +852,7 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
 
     if proto_model.pca is not None:
         metrics["pca_explained_variance_ratio_sum"] = float(np.sum(proto_model.pca.explained_variance_ratio_))
+        metrics["pca_seen_samples"] = _get_pca_seen_samples(proto_model.pca)
     if proto_model.centers is not None:
         metrics["effective_num_prototypes"] = int(proto_model.centers.shape[0])
 
@@ -1110,7 +882,6 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
         proto_model,
         gallery_path,
         num_examples=cfg.num_visualization_examples,
-        anom_maps_by_index=anom_maps_by_index,
     )
 
     print("Final metrics:")
@@ -1137,13 +908,6 @@ def parse_args() -> argparse.Namespace:
         choices=SUPPORTED_BACKBONE_MODELS,
         help="Pretrained timm backbone model name.",
     )
-    parser.add_argument("--batch-size", type=int, default=4, help="DataLoader batch size for feature extraction.")
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=2,
-        help="DataLoader workers (set 0 as robust fallback, e.g. for Colab multiprocessing issues).",
-    )
     parser.add_argument(
         "--num-visualization-examples",
         type=int,
@@ -1164,8 +928,6 @@ def main() -> None:
         num_prototypes=args.num_prototypes,
         pca_dim=args.pca_dim,
         distance_type=args.distance_type,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
         num_visualization_examples=args.num_visualization_examples,
         mahalanobis_alpha=args.mahalanobis_alpha,
         mahalanobis_min_var=args.mahalanobis_min_var,

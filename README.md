@@ -75,6 +75,16 @@ Nach erfolgreichem Lauf unter `/content/project/outputs/`:
 
 ADPretrain-Checkpoint-Support wurde entfernt; der PoC arbeitet jetzt ausschließlich mit direkt verfügbaren pretrained timm-Weights über `--backbone-model-name`.
 
+## Troubleshooting
+
+- Wenn du Fehler wie `AttributeError: 'PCA' object has no attribute 'n_samples_seen_'` siehst,
+  ist meist eine ältere Version des Skripts aktiv (z. B. in verschachtelten Colab-Klonpfaden wie
+  `/content/AnomalyD/AnomalyD/...`).
+- In diesem Stand wird PCA-sample-count kompatibel über `n_samples_seen_` **oder** `n_samples_`
+  behandelt.
+- Empfohlen: Repo in Colab einmal sauber neu klonen (alte verschachtelte Ordner entfernen) und
+  danach erneut ausführen.
+
 
 ## Stabilität bei kleiner Feature-Map
 

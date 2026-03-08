@@ -105,6 +105,22 @@ class PrototypeDistanceTests(unittest.TestCase):
         }
         self.assertTrue(required.issubset(set(SUPPORTED_BACKBONE_MODELS)))
 
+    def test_get_pca_seen_samples_prefers_available_attr(self) -> None:
+        from app.metal_nut_poc import _get_pca_seen_samples
+
+        class A:
+            n_samples_seen_ = 123
+
+        class B:
+            n_samples_ = 77
+
+        class C:
+            pass
+
+        self.assertEqual(_get_pca_seen_samples(A()), 123)
+        self.assertEqual(_get_pca_seen_samples(B()), 77)
+        self.assertEqual(_get_pca_seen_samples(C()), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
