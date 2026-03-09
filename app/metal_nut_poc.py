@@ -83,6 +83,7 @@ class PoCConfig:
     mahalanobis_eps: float = 1e-12
     topk_percent: float = 1.0
     batch_size: int = 4
+    eval_batch_size: int = 1
     num_workers: int = 2
     use_gaussian_smoothing: bool = True
     gaussian_sigma: float = 2.0
@@ -1221,6 +1222,10 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
     train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
     train_proto_t = float(proto_model.fit_timing.get("time_prototype_update_train", 0.0))
 
+    train_backbone = float(proto_model.fit_timing.get("time_backbone_forward_train", 0.0))
+    train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
+    train_proto_t = float(proto_model.fit_timing.get("time_prototype_update_train", 0.0))
+
     proto_model.save(ctx.metrics_dir)
 
     num_eval_passes_executed = 0
@@ -1416,6 +1421,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-feature-cache", action="store_true", default=False)
     parser.add_argument("--aupro-num-steps", type=int, default=80)
     parser.add_argument("--num-prototypes", type=int, default=512)
+    parser.add_argument("--eval-batch-size", type=int, default=1)
     parser.add_argument("--distance-type", type=str, default="l2", choices=["cosine", "l2", "mahalanobis_diag"])
     parser.add_argument("--projection-type", type=str, default="sparse_random_projection", choices=["sparse_random_projection", "gaussian_random_projection"])
     parser.add_argument("--projection-dim", type=int, default=96)
@@ -1473,6 +1479,7 @@ def main() -> None:
         disable_feature_cache=args.disable_feature_cache,
         aupro_num_steps=args.aupro_num_steps,
         num_prototypes=args.num_prototypes,
+        eval_batch_size=args.eval_batch_size,
         distance_type=args.distance_type,
         projection_type=args.projection_type,
         projection_dim=args.projection_dim,
