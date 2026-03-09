@@ -136,3 +136,6 @@ D) Optional fast-mode benchmark:
 ```bash
 python main.py --benchmark-fast-modes --max-allowed-pixel-auroc-drop 0.01
 ```
+
+
+Tip for faster post-evaluation on CPU: reduce AUPRO integration steps, e.g. `--aupro-num-steps 60` (default is 80).

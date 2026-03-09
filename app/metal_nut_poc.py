@@ -59,6 +59,7 @@ class PoCConfig:
     run_score_ablation: bool = False
     benchmark_fast_modes: bool = False
     max_allowed_pixel_auroc_drop: float = 0.01
+    aupro_num_steps: int = 80
     num_refine_rois: int = 3
     roi_crop_size: int = 192
     roi_expand_margin: int = 16
@@ -913,7 +914,7 @@ def _compute_aupro_for_subset(records: list[dict[str, Any]], max_fpr: float = 0.
     return float(area / max_fpr)
 
 
-def compute_per_defect_metrics(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def compute_per_defect_metrics(records: list[dict[str, Any]], aupro_num_steps: int = 80) -> list[dict[str, Any]]:
     defect_types = sorted({r["defect_type"] for r in records if r["defect_type"] != "good"})
     good_records = [r for r in records if r["defect_type"] == "good"]
     out: list[dict[str, Any]] = []
@@ -942,7 +943,7 @@ def compute_per_defect_metrics(records: list[dict[str, Any]]) -> list[dict[str, 
             y_true_pix, y_pred_pix, average="binary", zero_division=0
         )
 
-        aupro = _compute_aupro_for_subset(subset)
+        aupro = _compute_aupro_for_subset(subset, num_steps=aupro_num_steps)
 
         out.append(
             {
@@ -1117,7 +1118,7 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
     if proto_model.centers is not None:
         metrics["effective_num_prototypes"] = int(proto_model.centers.shape[0])
 
-    per_defect_metrics = compute_per_defect_metrics(per_sample_eval)
+    per_defect_metrics = compute_per_defect_metrics(per_sample_eval, aupro_num_steps=cfg.aupro_num_steps)
     aupro_values = [float(r["aupro"]) for r in per_defect_metrics if not np.isnan(float(r["aupro"]))]
     aupro_mean = float(np.mean(aupro_values)) if aupro_values else float("nan")
     image_f1_values = [float(r["image_f1"]) for r in per_defect_metrics]
@@ -1140,7 +1141,7 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
                 debug_mode=False,
             )
             num_eval_passes_executed += 1
-            c_per_def = compute_per_defect_metrics(c_eval)
+            c_per_def = compute_per_defect_metrics(c_eval, aupro_num_steps=cfg.aupro_num_steps)
             c_aupro = [float(r["aupro"]) for r in c_per_def if not np.isnan(float(r["aupro"]))]
             c_px_f1 = float(np.mean([float(r["pixel_f1"]) for r in c_per_def])) if c_per_def else float("nan")
             compare_rows.append({
@@ -1278,6 +1279,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-score-ablation", action="store_true", default=False)
     parser.add_argument("--benchmark-fast-modes", action="store_true", default=False)
     parser.add_argument("--max-allowed-pixel-auroc-drop", type=float, default=0.01)
+    parser.add_argument("--aupro-num-steps", type=int, default=80)
     parser.add_argument("--num-prototypes", type=int, default=512)
     parser.add_argument("--distance-type", type=str, default="l2", choices=["cosine", "l2", "mahalanobis_diag"])
     parser.add_argument("--projection-type", type=str, default="sparse_random_projection", choices=["sparse_random_projection", "gaussian_random_projection"])
@@ -1333,6 +1335,7 @@ def main() -> None:
         run_score_ablation=args.run_score_ablation,
         benchmark_fast_modes=args.benchmark_fast_modes,
         max_allowed_pixel_auroc_drop=args.max_allowed_pixel_auroc_drop,
+        aupro_num_steps=args.aupro_num_steps,
         num_prototypes=args.num_prototypes,
         distance_type=args.distance_type,
         projection_type=args.projection_type,
