@@ -1210,22 +1210,6 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
     train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
     train_proto_t = float(proto_model.fit_timing.get("time_prototype_update_train", 0.0))
 
-    train_backbone = float(proto_model.fit_timing.get("time_backbone_forward_train", 0.0))
-    train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
-    train_proto_t = float(proto_model.fit_timing.get("time_prototype_update_train", 0.0))
-
-    train_backbone = float(proto_model.fit_timing.get("time_backbone_forward_train", 0.0))
-    train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
-    train_proto_t = float(proto_model.fit_timing.get("time_prototype_update_train", 0.0))
-
-    train_backbone = float(proto_model.fit_timing.get("time_backbone_forward_train", 0.0))
-    train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
-    train_proto_t = float(proto_model.fit_timing.get("time_prototype_update_train", 0.0))
-
-    train_backbone = float(proto_model.fit_timing.get("time_backbone_forward_train", 0.0))
-    train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
-    train_proto_t = float(proto_model.fit_timing.get("time_prototype_update_train", 0.0))
-
     proto_model.save(ctx.metrics_dir)
 
     num_eval_passes_executed = 0
@@ -1459,42 +1443,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    cfg = PoCConfig(
-        backbone_model_name=args.backbone_model_name,
-        feature_size_factor=args.feature_size_factor,
-        feature_layer_mode=args.feature_layer_mode,
-        enable_two_stage_inference=args.enable_two_stage_inference,
-        refine_feature_size_factor=args.refine_feature_size_factor,
-        num_refine_rois=args.num_refine_rois,
-        roi_crop_size=args.roi_crop_size,
-        roi_expand_margin=args.roi_expand_margin,
-        stage_a_trigger_threshold=args.stage_a_trigger_threshold,
-        image_score_mode=args.image_score_mode,
-        inference_backend=args.inference_backend,
-        run_comparison_suite=args.run_comparison_suite,
-        run_two_stage_experiment=args.run_two_stage_experiment,
-        run_score_ablation=args.run_score_ablation,
-        benchmark_fast_modes=args.benchmark_fast_modes,
-        max_allowed_pixel_auroc_drop=args.max_allowed_pixel_auroc_drop,
-        disable_feature_cache=args.disable_feature_cache,
-        aupro_num_steps=args.aupro_num_steps,
-        num_prototypes=args.num_prototypes,
-        eval_batch_size=args.eval_batch_size,
-        distance_type=args.distance_type,
-        projection_type=args.projection_type,
-        projection_dim=args.projection_dim,
-        projection_seed=args.projection_seed,
-        whitening_eps=args.whitening_eps,
-        enable_diagnostics=args.enable_diagnostics,
-        debug_mode=args.debug_mode,
-        save_per_sample_report=args.save_per_sample_report,
-        save_plots=args.save_plots,
-        num_visualization_examples=args.num_visualization_examples,
-        eval_batch_size=args.eval_batch_size,
-        mahalanobis_alpha=args.mahalanobis_alpha,
-        mahalanobis_min_var=args.mahalanobis_min_var,
-        mahalanobis_eps=args.mahalanobis_eps,
-    )
+    cfg = PoCConfig(**vars(args))
     run_poc(cfg)
 
 
