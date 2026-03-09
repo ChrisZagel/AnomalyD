@@ -95,3 +95,20 @@ Main classes:
 - With `enable_diagnostics=True`, lightweight baseline outputs are always written (`summary.json`, `timing_summary.json`, `transform_summary.json`, `prototype_summary.json`, `incremental_update_log.csv`, `forgetting_report.csv`).
 - With `debug_mode=True`, richer diagnostics (per-sample table + debug plots) are added on top.
 - Timing and score-separation metrics reuse values already computed during fit/eval to keep runtime overhead low.
+
+
+## 12) Single-stage vs two-stage inference
+
+- **Single-stage**: full-image pass only (fast baseline, lower local refinement quality).
+- **Two-stage** (default):
+  1. Stage A global screening at `feature_size_factor=0.75` using `feature_layer_mode=fast_2layer`.
+  2. ROI proposal from coarse anomaly map (top maxima + lightweight overlap suppression).
+  3. Stage B selective ROI refinement at `refine_feature_size_factor=1.0`.
+  4. Refined ROI scores merged into final pixel map.
+
+This keeps average runtime low (no full-image high-res pass) while improving tiny/thin defect localization.
+
+## 13) Feature layer modes
+
+- `fast_2layer` (default): mid+late features only, lower backbone-side feature processing cost.
+- `full_3layer`: previous richer fusion mode for comparison.

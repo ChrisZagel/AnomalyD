@@ -50,6 +50,16 @@ class PoCConfig:
     project_root: str = "/content/project"
     backbone_model_name: str = "vit_base_patch14_dinov2.lvd142m"
     feature_size_factor: float = 0.75
+    feature_layer_mode: str = "fast_2layer"
+    enable_two_stage_inference: bool = True
+    refine_feature_size_factor: float = 1.0
+    num_refine_rois: int = 3
+    roi_crop_size: int = 192
+    roi_expand_margin: int = 16
+    stage_a_trigger_threshold: float = 2.5
+    stage_a_trigger_mode: str = "image_or_patch"
+    enable_refine_on_good_margin: float = 0.15
+    image_score_mode: str = "hybrid_global_local"
     num_prototypes: int = 512
     transform_type: str = "running_whiten_fixed_proj"
     projection_type: str = "sparse_random_projection"
@@ -212,19 +222,33 @@ class FeatureExtractor:
         )
 
     @torch.no_grad()
-    def extract_patch_features(self, image: Image.Image) -> tuple[np.ndarray, tuple[int, int], tuple[int, int]]:
+    def extract_patch_features(
+        self,
+        image: Image.Image,
+        *,
+        feature_size_factor: float | None = None,
+        feature_layer_mode: str | None = None,
+    ) -> tuple[np.ndarray, tuple[int, int], tuple[int, int]]:
         tensor = self.transform(image).unsqueeze(0).to(self.device)
         orig_h, orig_w = tensor.shape[-2:]
-        if self.cfg.feature_size_factor != 1.0:
-            work_h = max(14, int(round(orig_h * self.cfg.feature_size_factor / 14) * 14))
-            work_w = max(14, int(round(orig_w * self.cfg.feature_size_factor / 14) * 14))
+        fsf = self.cfg.feature_size_factor if feature_size_factor is None else feature_size_factor
+        if fsf != 1.0:
+            work_h = max(14, int(round(orig_h * fsf / 14) * 14))
+            work_w = max(14, int(round(orig_w * fsf / 14) * 14))
             tensor = F.interpolate(tensor, size=(work_h, work_w), mode="bilinear", align_corners=False)
         else:
             work_h, work_w = orig_h, orig_w
 
         maps = self.backbone(tensor)
-        target_hw = maps[-1].shape[-2:]
+        layer_mode = self.cfg.feature_layer_mode if feature_layer_mode is None else feature_layer_mode
+        if layer_mode == "fast_2layer" and len(maps) >= 2:
+            # mid + late representation
+            sel = [max(0, len(maps) - 2), len(maps) - 1]
+            maps = [maps[i] for i in sel]
+        elif layer_mode == "full_3layer" and len(maps) >= 3:
+            maps = maps[-3:]
 
+        target_hw = maps[-1].shape[-2:]
         norm_maps = []
         for fmap in maps:
             if fmap.shape[-2:] != target_hw:
@@ -339,29 +363,157 @@ class PrototypeAnomalyModel:
         with open(output_dir / "prototype_model.pkl", "wb") as f:
             pickle.dump(payload, f)
 
+    def _compute_image_score(self, anomaly_map: np.ndarray, coarse_score: float, refined_max: float) -> float:
+        mode = self.cfg.image_score_mode
+        flat = anomaly_map.ravel()
+        topk = max(1, int(flat.size * self.cfg.topk_percent / 100.0))
+        top_mean = float(np.mean(np.partition(flat, -topk)[-topk:]))
+        if mode == "max_patch":
+            return float(np.max(flat))
+        if mode == "topk_patch_mean":
+            return top_mean
+        if mode == "top1_percent_mean":
+            k = max(1, int(flat.size * 0.01))
+            return float(np.mean(np.partition(flat, -k)[-k:]))
+        # hybrid_global_local
+        return float(0.6 * coarse_score + 0.4 * max(refined_max, top_mean))
+
+    @staticmethod
+    def _propose_rois_from_map(
+        anomaly_map: np.ndarray,
+        num_rois: int,
+        crop_size: int,
+        margin: int,
+    ) -> list[tuple[int, int, int, int]]:
+        h, w = anomaly_map.shape
+        flat_idx = np.argpartition(anomaly_map.ravel(), -min(num_rois * 8, anomaly_map.size))[-min(num_rois * 8, anomaly_map.size):]
+        ys, xs = np.unravel_index(flat_idx, anomaly_map.shape)
+        scores = anomaly_map[ys, xs]
+        order = np.argsort(scores)[::-1]
+        rois: list[tuple[int, int, int, int]] = []
+        used_centers: list[tuple[int, int]] = []
+        suppress_dist = max(8, crop_size // 3)
+        for oi in order:
+            cy, cx = int(ys[oi]), int(xs[oi])
+            if any((cy - uy) ** 2 + (cx - ux) ** 2 < suppress_dist**2 for uy, ux in used_centers):
+                continue
+            y1 = max(0, cy - crop_size // 2 - margin)
+            y2 = min(h, cy + crop_size // 2 + margin)
+            x1 = max(0, cx - crop_size // 2 - margin)
+            x2 = min(w, cx + crop_size // 2 + margin)
+            if y2 - y1 < 8 or x2 - x1 < 8:
+                continue
+            rois.append((y1, x1, y2, x2))
+            used_centers.append((cy, cx))
+            if len(rois) >= num_rois:
+                break
+        return rois
+
     def infer_map(
         self,
         image: Image.Image,
         extractor: FeatureExtractor,
         orig_size: tuple[int, int],
-    ) -> tuple[np.ndarray, float]:
+    ) -> tuple[np.ndarray, float, dict[str, Any]]:
         if self.inc_model is None:
             raise RuntimeError("Model is not fitted yet.")
 
-        feats, grid_hw, work_hw = extractor.extract_patch_features(image)
+        t0 = time.perf_counter()
+        feats, grid_hw, work_hw = extractor.extract_patch_features(
+            image,
+            feature_size_factor=self.cfg.feature_size_factor,
+            feature_layer_mode=self.cfg.feature_layer_mode,
+        )
+        t1 = time.perf_counter()
         patch_scores = self.inc_model.predict(feats.astype(np.float32))
+        t2 = time.perf_counter()
 
         token_map = patch_scores.reshape(grid_hw)
         token_map_t = torch.from_numpy(token_map).unsqueeze(0).unsqueeze(0).float()
         work_map = F.interpolate(token_map_t, size=work_hw, mode="bilinear", align_corners=False)
-        full_map = F.interpolate(work_map, size=orig_size, mode="bilinear", align_corners=False)[0, 0].numpy()
+        coarse_map = F.interpolate(work_map, size=orig_size, mode="bilinear", align_corners=False)[0, 0].numpy()
 
         if self.cfg.use_gaussian_smoothing:
-            full_map = gaussian_filter(full_map, sigma=self.cfg.gaussian_sigma)
+            coarse_map = gaussian_filter(coarse_map, sigma=self.cfg.gaussian_sigma)
 
-        topk = max(1, int(full_map.size * self.cfg.topk_percent / 100.0))
-        image_score = float(np.mean(np.partition(full_map.ravel(), -topk)[-topk:]))
-        return full_map, image_score
+        topk = max(1, int(coarse_map.size * self.cfg.topk_percent / 100.0))
+        stage_a_image_score = float(np.mean(np.partition(coarse_map.ravel(), -topk)[-topk:]))
+        t3 = time.perf_counter()
+
+        trigger_patch = float(np.max(coarse_map)) > self.cfg.stage_a_trigger_threshold
+        trigger_image = stage_a_image_score > self.cfg.stage_a_trigger_threshold
+        if self.cfg.stage_a_trigger_mode == "image_or_patch":
+            stage_a_triggered = trigger_patch or trigger_image
+        else:
+            stage_a_triggered = trigger_image
+        stage_a_triggered = stage_a_triggered or (
+            stage_a_image_score > (self.cfg.stage_a_trigger_threshold - self.cfg.enable_refine_on_good_margin)
+        )
+
+        final_map = coarse_map.copy()
+        refined_max = float(np.max(coarse_map))
+        num_rois = 0
+        t_roi0 = time.perf_counter()
+        rois = self._propose_rois_from_map(
+            coarse_map,
+            num_rois=self.cfg.num_refine_rois,
+            crop_size=self.cfg.roi_crop_size,
+            margin=self.cfg.roi_expand_margin,
+        ) if (self.cfg.enable_two_stage_inference and stage_a_triggered) else []
+        t_roi1 = time.perf_counter()
+
+        stage_b_backbone = 0.0
+        stage_b_distance = 0.0
+        t_merge = 0.0
+        if rois:
+            arr = np.array(image)
+            for (y1, x1, y2, x2) in rois:
+                crop = Image.fromarray(arr[y1:y2, x1:x2])
+                tb0 = time.perf_counter()
+                c_feats, c_grid, c_work = extractor.extract_patch_features(
+                    crop,
+                    feature_size_factor=self.cfg.refine_feature_size_factor,
+                    feature_layer_mode=("full_3layer" if self.cfg.feature_layer_mode == "full_3layer" else "fast_2layer"),
+                )
+                tb1 = time.perf_counter()
+                c_scores = self.inc_model.predict(c_feats.astype(np.float32))
+                tb2 = time.perf_counter()
+                c_token = c_scores.reshape(c_grid)
+                c_t = torch.from_numpy(c_token).unsqueeze(0).unsqueeze(0).float()
+                c_work_map = F.interpolate(c_t, size=c_work, mode="bilinear", align_corners=False)
+                c_map = F.interpolate(c_work_map, size=(y2 - y1, x2 - x1), mode="bilinear", align_corners=False)[0, 0].numpy()
+                tm0 = time.perf_counter()
+                final_map[y1:y2, x1:x2] = np.maximum(final_map[y1:y2, x1:x2], c_map)
+                tm1 = time.perf_counter()
+                refined_max = max(refined_max, float(np.max(c_map)))
+                stage_b_backbone += float(tb1 - tb0)
+                stage_b_distance += float(tb2 - tb1)
+                t_merge += float(tm1 - tm0)
+            num_rois = len(rois)
+
+        final_image_score = self._compute_image_score(final_map, stage_a_image_score, refined_max)
+        if self.cfg.use_gaussian_smoothing:
+            final_map = gaussian_filter(final_map, sigma=self.cfg.gaussian_sigma)
+
+        timing = {
+            "stage_a_backbone_time": float(t1 - t0),
+            "stage_b_backbone_time": float(stage_b_backbone),
+            "roi_proposal_time": float(t_roi1 - t_roi0),
+            "merge_time": float(t_merge),
+            "time_backbone_forward_eval": float((t1 - t0) + stage_b_backbone),
+            "time_transform_eval": 0.0,
+            "time_distance_eval": float((t2 - t1) + stage_b_distance),
+            "time_postprocess_eval": float((t3 - t2) + t_merge),
+        }
+        meta = {
+            "stage_a_triggered": int(stage_a_triggered),
+            "num_refine_rois": int(num_rois),
+            "stage_a_image_score": float(stage_a_image_score),
+            "stage_b_refined_max_score": float(refined_max),
+            "final_image_score": float(final_image_score),
+            **timing,
+        }
+        return final_map, float(final_image_score), meta
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -518,70 +670,50 @@ def evaluate(
     t_transform = 0.0
     t_distance = 0.0
     t_post = 0.0
+    t_stage_a_backbone = 0.0
+    t_stage_b_backbone = 0.0
+    t_roi = 0.0
+    t_merge = 0.0
+    triggered = 0
+    refine_rois_total = 0
+
     for idx in tqdm(range(len(test_ds)), desc="Evaluate test set"):
         sample = test_ds[idx]
         t0 = time.perf_counter()
-        feats, grid_hw, work_hw = extractor.extract_patch_features(sample["image"])
-        t1 = time.perf_counter()
-        patch_scores = proto_model.inc_model.predict(feats.astype(np.float32)) if proto_model.inc_model is not None else np.zeros((grid_hw[0] * grid_hw[1],), dtype=np.float32)
-        t2 = time.perf_counter()
-        token_map = patch_scores.reshape(grid_hw)
-        token_map_t = torch.from_numpy(token_map).unsqueeze(0).unsqueeze(0).float()
-        work_map = F.interpolate(token_map_t, size=work_hw, mode="bilinear", align_corners=False)
-        anom_map = F.interpolate(work_map, size=sample["orig_size"], mode="bilinear", align_corners=False)[0, 0].numpy()
-        if proto_model.cfg.use_gaussian_smoothing:
-            anom_map = gaussian_filter(anom_map, sigma=proto_model.cfg.gaussian_sigma)
-        topk = max(1, int(anom_map.size * proto_model.cfg.topk_percent / 100.0))
-        image_score = float(np.mean(np.partition(anom_map.ravel(), -topk)[-topk:]))
-        t3 = time.perf_counter()
-        infer_sec = t3 - t0
-        t_backbone += float(t1 - t0)
-        t_transform += 0.0
-        t_distance += float(t2 - t1)
-        t_post += float(t3 - t2)
+        anom_map, image_score, meta = proto_model.infer_map(sample["image"], extractor, sample["orig_size"])
+        infer_sec = time.perf_counter() - t0
+
+        t_backbone += float(meta.get("time_backbone_forward_eval", 0.0))
+        t_transform += float(meta.get("time_transform_eval", 0.0))
+        t_distance += float(meta.get("time_distance_eval", 0.0))
+        t_post += float(meta.get("time_postprocess_eval", 0.0))
+        t_stage_a_backbone += float(meta.get("stage_a_backbone_time", 0.0))
+        t_stage_b_backbone += float(meta.get("stage_b_backbone_time", 0.0))
+        t_roi += float(meta.get("roi_proposal_time", 0.0))
+        t_merge += float(meta.get("merge_time", 0.0))
+        triggered += int(meta.get("stage_a_triggered", 0))
+        refine_rois_total += int(meta.get("num_refine_rois", 0))
 
         image_labels.append(sample["label"])
         image_scores.append(image_score)
         pixel_labels.append(sample["mask"].astype(np.uint8).ravel())
         pixel_scores.append(anom_map.ravel())
 
-        score_thr = float(np.quantile(anom_map, 0.99))
-        pred_area = float(np.mean(anom_map >= score_thr))
-        gt_area = float(np.mean(sample["mask"] > 0))
-        iou = float(
-            np.sum((anom_map >= score_thr) & (sample["mask"] > 0))
-            / (np.sum((anom_map >= score_thr) | (sample["mask"] > 0)) + 1e-8)
-        )
-
         row = {
-            "image_path": sample["path"],
-            "defect_type": sample["defect_type"],
-            "is_good": int(sample["label"] == 0),
-            "image_score": float(image_score),
-            "image_pred": int(image_score >= score_thr),
-            "image_gt": int(sample["label"]),
-            "max_patch_score": float(np.max(anom_map)),
-            "top1_percent_mean": float(np.mean(np.partition(anom_map.ravel(), -max(1, int(anom_map.size * 0.01)))[-max(1, int(anom_map.size * 0.01)):])) ,
-            "predicted_anomalous_area": pred_area,
-            "gt_anomalous_area": gt_area,
-            "iou_at_threshold": iou,
-            "nearest_prototype_id": -1,
-            "nearest_distance": float(np.min(anom_map)),
-            "time_total_infer": float(infer_sec),
             "index": idx,
+            "path": sample["path"],
+            "defect_type": sample["defect_type"],
             "label": sample["label"],
+            "image_score": float(image_score),
+            "infer_time_sec": float(infer_sec),
+            "map_mean": float(anom_map.mean()),
+            "map_max": float(anom_map.max()),
+            "stage_a_triggered": int(meta.get("stage_a_triggered", 0)),
+            "num_refine_rois": int(meta.get("num_refine_rois", 0)),
+            "stage_a_image_score": float(meta.get("stage_a_image_score", image_score)),
+            "stage_b_refined_max_score": float(meta.get("stage_b_refined_max_score", np.max(anom_map))),
+            "final_image_score": float(meta.get("final_image_score", image_score)),
         }
-        if not debug_mode:
-            row = {
-                "index": idx,
-                "path": sample["path"],
-                "defect_type": sample["defect_type"],
-                "label": sample["label"],
-                "image_score": float(image_score),
-                "infer_time_sec": float(infer_sec),
-                "map_mean": float(anom_map.mean()),
-                "map_max": float(anom_map.max()),
-            }
         per_sample_rows.append(row)
 
         per_sample_eval.append(
@@ -605,12 +737,23 @@ def evaluate(
         "image_auroc": image_auc,
         "pixel_auroc": pixel_auc,
         "num_test_images": len(test_ds),
-        "mean_infer_time_sec": float(np.mean([r.get("infer_time_sec", r.get("time_total_infer", 0.0)) for r in per_sample_rows])),
-        "std_infer_time_sec": float(np.std([r.get("infer_time_sec", r.get("time_total_infer", 0.0)) for r in per_sample_rows])),
+        "mean_infer_time_sec": float(np.mean([r["infer_time_sec"] for r in per_sample_rows])),
+        "std_infer_time_sec": float(np.std([r["infer_time_sec"] for r in per_sample_rows])),
+        "stage_a_trigger_rate": float(triggered / max(len(test_ds), 1)),
+        "mean_num_refine_rois_used": float(refine_rois_total / max(len(test_ds), 1)),
+        "mean_stage_b_time": float(t_stage_b_backbone / max(len(test_ds), 1)),
     }
-    timing = {"time_backbone_forward_eval": t_backbone, "time_transform_eval": t_transform, "time_distance_eval": t_distance, "time_postprocess_eval": t_post}
+    timing = {
+        "time_backbone_forward_eval": t_backbone,
+        "time_transform_eval": t_transform,
+        "time_distance_eval": t_distance,
+        "time_postprocess_eval": t_post,
+        "stage_a_backbone_time": t_stage_a_backbone,
+        "stage_b_backbone_time": t_stage_b_backbone,
+        "roi_proposal_time": t_roi,
+        "merge_time": t_merge,
+    }
     return metrics, per_sample_rows, per_sample_eval, np.array(image_scores, dtype=np.float32), np.concatenate(pixel_scores), timing
-
 
 def compute_defect_level_aurocs(rows: list[dict[str, Any]]) -> dict[str, float]:
     good_scores = [r["image_score"] for r in rows if r["defect_type"] == "good"]
@@ -915,6 +1058,10 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
         "time_transform_eval": float(eval_timing.get("time_transform_eval", 0.0)),
         "time_distance_eval": float(eval_timing.get("time_distance_eval", 0.0)),
         "time_postprocess_eval": float(eval_timing.get("time_postprocess_eval", 0.0)),
+        "stage_a_backbone_time": float(eval_timing.get("stage_a_backbone_time", 0.0)),
+        "stage_b_backbone_time": float(eval_timing.get("stage_b_backbone_time", 0.0)),
+        "roi_proposal_time": float(eval_timing.get("roi_proposal_time", 0.0)),
+        "merge_time": float(eval_timing.get("merge_time", 0.0)),
         "mean_infer_time_sec": float(metrics["mean_infer_time_sec"]),
     }
 
@@ -938,6 +1085,12 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
         "mean_infer_time_sec": float(metrics["mean_infer_time_sec"]),
         "total_runtime_sec": float(total_time),
         "effective_num_prototypes": int(metrics.get("effective_num_prototypes", 0)),
+        "image_score_mode": cfg.image_score_mode,
+        "feature_layer_mode": cfg.feature_layer_mode,
+        "stage_a_trigger_rate": float(metrics.get("stage_a_trigger_rate", 0.0)),
+        "mean_num_refine_rois_used": float(metrics.get("mean_num_refine_rois_used", 0.0)),
+        "mean_stage_b_time": float(metrics.get("mean_stage_b_time", 0.0)),
+        "refined_pixel_auroc": float(metrics.get("pixel_auroc", float("nan"))),
         "image_score_good_mean": float(np.mean([r["image_score"] for r in per_sample_eval if r["label"] == 0])) if any(r["label"] == 0 for r in per_sample_eval) else float("nan"),
         "image_score_good_std": float(np.std([r["image_score"] for r in per_sample_eval if r["label"] == 0])) if any(r["label"] == 0 for r in per_sample_eval) else float("nan"),
         "image_score_defect_mean": float(np.mean([r["image_score"] for r in per_sample_eval if r["label"] == 1])) if any(r["label"] == 1 for r in per_sample_eval) else float("nan"),
@@ -1022,6 +1175,42 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
         if cfg.debug_mode:
             debug_reporter.create_debug_plots(per_defect_metrics, image_scores, pixel_scores, timing_summary)
 
+    # automatic single-stage vs two-stage comparison
+    if cfg.enable_diagnostics:
+        compare_rows: list[dict[str, Any]] = []
+        current_mode = bool(cfg.enable_two_stage_inference)
+        for mode_name, mode_flag in [("single_stage", False), ("two_stage", True)]:
+            prev = cfg.enable_two_stage_inference
+            cfg.enable_two_stage_inference = mode_flag
+            c_metrics, _, c_eval, _, _, _ = evaluate(
+                test_ds,
+                extractor,
+                proto_model,
+                ctx.visualizations_dir,
+                save_visualizations=False,
+                num_visualization_examples=0,
+                debug_mode=False,
+            )
+            c_per_def = compute_per_defect_metrics(c_eval)
+            aupro_vals = [float(r["aupro"]) for r in c_per_def if not np.isnan(float(r["aupro"]))]
+            px_f1 = float(np.mean([float(r["pixel_f1"]) for r in c_per_def])) if c_per_def else float("nan")
+            compare_rows.append({
+                "mode": mode_name,
+                "image_auroc": float(c_metrics["image_auroc"]),
+                "pixel_auroc": float(c_metrics["pixel_auroc"]),
+                "aupro": float(np.mean(aupro_vals)) if aupro_vals else float("nan"),
+                "pixel_f1": px_f1,
+                "mean_infer_time_sec": float(c_metrics["mean_infer_time_sec"]),
+            })
+            cfg.enable_two_stage_inference = prev
+        import csv
+        cmp_path = ctx.tables_dir / "two_stage_comparison.csv"
+        with open(cmp_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(compare_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(compare_rows)
+        cfg.enable_two_stage_inference = current_mode
+
     experiment_writer.append_row(
         {
             "run_id": ctx.run_id,
@@ -1061,6 +1250,15 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MVTec AD metal_nut PoC (pretrained timm backbones)")
     parser.add_argument("--feature-size-factor", type=float, default=0.75)
+    parser.add_argument("--feature-layer-mode", type=str, default="fast_2layer", choices=["fast_2layer", "full_3layer"])
+    parser.add_argument("--enable-two-stage-inference", dest="enable_two_stage_inference", action="store_true", default=True)
+    parser.add_argument("--disable-two-stage-inference", dest="enable_two_stage_inference", action="store_false")
+    parser.add_argument("--refine-feature-size-factor", type=float, default=1.0)
+    parser.add_argument("--num-refine-rois", type=int, default=3)
+    parser.add_argument("--roi-crop-size", type=int, default=192)
+    parser.add_argument("--roi-expand-margin", type=int, default=16)
+    parser.add_argument("--stage-a-trigger-threshold", type=float, default=2.5)
+    parser.add_argument("--image-score-mode", type=str, default="hybrid_global_local", choices=["top1_percent_mean", "topk_patch_mean", "max_patch", "hybrid_global_local"])
     parser.add_argument("--num-prototypes", type=int, default=512)
     parser.add_argument("--distance-type", type=str, default="l2", choices=["cosine", "l2", "mahalanobis_diag"])
     parser.add_argument("--projection-type", type=str, default="sparse_random_projection", choices=["sparse_random_projection", "gaussian_random_projection"])
@@ -1102,6 +1300,14 @@ def main() -> None:
     cfg = PoCConfig(
         backbone_model_name=args.backbone_model_name,
         feature_size_factor=args.feature_size_factor,
+        feature_layer_mode=args.feature_layer_mode,
+        enable_two_stage_inference=args.enable_two_stage_inference,
+        refine_feature_size_factor=args.refine_feature_size_factor,
+        num_refine_rois=args.num_refine_rois,
+        roi_crop_size=args.roi_crop_size,
+        roi_expand_margin=args.roi_expand_margin,
+        stage_a_trigger_threshold=args.stage_a_trigger_threshold,
+        image_score_mode=args.image_score_mode,
         num_prototypes=args.num_prototypes,
         distance_type=args.distance_type,
         projection_type=args.projection_type,

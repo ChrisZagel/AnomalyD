@@ -92,3 +92,20 @@ Use `experiment_results.csv` to compare runs by backbone, transform config, AURO
 - `--debug-mode`: adds extended diagnostics (per-sample report and selected plots) on top of baseline diagnostics.
 
 Normal diagnostics stay lightweight; debug mode is intended for deeper analysis.
+
+
+## Single-stage vs two-stage commands
+
+Fast single-stage baseline:
+
+```bash
+python main.py --feature-layer-mode fast_2layer --disable-two-stage-inference
+```
+
+Two-stage refinement mode (default):
+
+```bash
+python main.py --feature-layer-mode fast_2layer --enable-two-stage-inference --num-refine-rois 3 --image-score-mode hybrid_global_local
+```
+
+Use single-stage for strict latency benchmarking; use two-stage when tiny/local defect localization quality matters more.
