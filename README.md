@@ -1,96 +1,138 @@
-# MVTec AD `metal_nut` PoC for Google Colab
+# AnomalyD
 
-## Kurze Architekturzusammenfassung
+## Project purpose
 
-Dieser PoC implementiert eine **normal-only, patch-basierte Anomalieerkennung** auf **MVTec AD `metal_nut`**:
+Lean, patch-based industrial anomaly detection for MVTec-style data with a frozen backbone and a fully incremental normality model.
 
-1. **Gefrorener Backbone:** vortrainiertes timm-Backbone (konfigurierbar über `--backbone-model-name`).
-2. **Multi-Level Features:** 3 Ebenen (ViT-Intermediate oder letzte 3 `features_only`-Maps bei CNN/Hybrid-Backbones).
-3. **Feature-Fusion:** Ebenen auf gemeinsames Raster, L2-Norm, Concat.
-4. **PCA + Prototypen:** PCA-Reduktion und MiniBatchKMeans auf `train/good`.
-5. **Inference:** Distanz zu Prototypen -> Pixel-Anomaly-Map + Image-Score.
-6. **Evaluation:** Image-AUROC + Pixel-AUROC, plus Profiling-/Diagnose-Outputs.
+## Main architecture (short)
 
-Die Pipeline läuft auf CPU und GPU in Colab.
+`image -> frozen backbone -> multi-level fused patch features -> running whitening -> fixed random projection -> prototypes -> anomaly score`
 
----
+- no backbone finetuning
+- no PCA
+- incremental updates with replay memory and candidate prototypes
 
-## Start in Colab
+## Installation
 
-```python
-!git clone <DEIN_REPO_URL>
-%cd AnomalyD
-!pip install -r requirements.txt
-!python main.py --backbone-model-name vit_base_patch14_dinov2.lvd142m
+```bash
+pip install -r requirements.txt
 ```
 
-Beispiele:
+## Dataset setup
 
-```python
-!python main.py --backbone-model-name vit_small_patch14_dinov2.lvd142m
-!python main.py --backbone-model-name shvit_s4.in1k
-!python main.py --backbone-model-name edgenext_small.usi_in1k
+Default run downloads/extracts `metal_nut` into `/content/data/mvtec_ad` if needed.
+You can override paths in `PoCConfig` or adapt CLI usage in notebooks/scripts.
+
+## Example commands
+
+### Normal run (lean diagnostics)
+
+```bash
+python main.py --backbone-model-name vit_base_patch14_dinov2.lvd142m --enable-diagnostics
 ```
 
----
+### Debug run (extended diagnostics)
 
-## Unterstützte Backbones / Weights
+```bash
+python main.py --debug-mode --save-per-sample-report --save-plots --num-visualization-examples 5
+```
 
-Folgende Namen werden explizit unterstützt:
+### Incremental update run (API)
 
-- `vit_base_patch14_dinov2.lvd142m`
-- `vit_base_patch14_reg4_dinov2.lvd142m`
-- `vit_small_patch14_dinov2.lvd142m`
-- `shvit_s4.in1k`
-- `edgenext_small.usi_in1k`
+```python
+from app.incremental_model import IncrementalADModel
 
----
+model = IncrementalADModel({"projection_dim": 96, "distance_type": "l2", "num_prototypes": 512})
+model.fit_initial(train_patch_features)
+model.update_incremental([new_img_patch_feats])
+model.consolidate()
+model.save_state("incremental_state.pkl")
+```
 
-## Wichtige CLI-Parameter
+## Important parameters
 
-- `--backbone-model-name` (siehe Liste oben)
-- `--feature-size-factor` (z. B. `1.0`, `0.75`, `0.5`)
-- `--num-prototypes` (z. B. `256`)
-- `--pca-dim` (z. B. `128`)
-- `--distance-type` (`cosine`, `l2`, `mahalanobis_diag`)
-- `--mahalanobis-alpha`, `--mahalanobis-min-var`, `--mahalanobis-eps` (nur für `mahalanobis_diag`)
-- `--num-visualization-examples` (Default `5`)
+- `--backbone-model-name`: pretrained timm backbone
+- `--feature-size-factor`: controls processing resolution
+- `--num-prototypes`: prototype capacity in projected space
+- `--distance-type`: `l2`, `cosine`, or `mahalanobis_diag`
+- `--enable-diagnostics/--disable-diagnostics`: on/off diagnostics outputs
+- `--debug-mode`: enables richer diagnostics
 
----
+## Output folder structure
 
-## Outputs
+Each run writes to:
 
-Nach erfolgreichem Lauf unter `/content/project/outputs/`:
+`/content/project/outputs/<run_id>/`
 
-- `metrics.json` / `metrics.csv`
-- `per_sample_report.csv`
-- `per_defect_metrics.csv` (Pixel-AUROC, AUPRO, Image/Pixel Precision-Recall-F1 pro Fehlertyp)
-- `models/prototype_model.pkl`
-- `visualizations/*.png`
-- `visualizations/final_top5_overlay_gallery.png`
+Subfolders:
+- `metrics/`
+- `tables/`
+- `plots/`
+- `visualizations/`
 
----
+Global comparison table:
+- `/content/project/outputs/experiment_results.csv`
 
-## Hinweis
+## Compare experiments
 
-ADPretrain-Checkpoint-Support wurde entfernt; der PoC arbeitet jetzt ausschließlich mit direkt verfügbaren pretrained timm-Weights über `--backbone-model-name`.
+Use `experiment_results.csv` to compare runs by backbone, transform config, AUROC/AUPRO, and runtime in a single table.
 
-## Troubleshooting
+## How to extend the system
 
-- Wenn du Fehler wie `AttributeError: 'PCA' object has no attribute 'n_samples_seen_'` siehst,
-  ist meist eine ältere Version des Skripts aktiv (z. B. in verschachtelten Colab-Klonpfaden wie
-  `/content/AnomalyD/AnomalyD/...`).
-- In diesem Stand wird PCA-sample-count kompatibel über `n_samples_seen_` **oder** `n_samples_`
-  behandelt.
-- Empfohlen: Repo in Colab einmal sauber neu klonen (alte verschachtelte Ordner entfernen) und
-  danach erneut ausführen.
-
-
-## Stabilität bei kleiner Feature-Map
-
-Wenn ein Backbone eine sehr grobe Feature-Map liefert (z. B. wenige Patch-Features pro Bild), wird die effektive Anzahl der Prototypen automatisch auf die verfügbare Anzahl reduzierter Trainings-Patches begrenzt. Dadurch wird der Fehler `n_samples < n_clusters` vermieden.
+- add new distance functions in `PrototypeStore`
+- add new replay policies in `ReplayMemoryManager`
+- keep hot path lean; add expensive diagnostics only behind `debug_mode`
+- document architecture changes in `ARCHITECTURE.md`
 
 
-## Mahalanobis (diag) Distanz
+## Diagnostics switches
 
-Bei `--distance-type mahalanobis_diag` werden nach PCA+KMeans pro Prototyp diagonale Varianzen aus den PCA-Trainingsfeatures geschätzt (mit globaler Varianz-Regularisierung und Mindestvarianz-Clipping). Die zusätzlichen Statistikparameter werden mit dem Modell gespeichert.
+- `--enable-diagnostics` (default): writes lean baseline metrics/tables.
+- `--disable-diagnostics`: disables diagnostics files and keeps only console/final minimal output.
+- `--debug-mode`: adds extended diagnostics (per-sample report and selected plots) on top of baseline diagnostics.
+
+Normal diagnostics stay lightweight; debug mode is intended for deeper analysis.
+
+
+## Single-stage vs two-stage commands (optional two-stage)
+
+Fast single-stage baseline:
+
+```bash
+python main.py --feature-layer-mode single_last_layer --disable-two-stage-inference
+```
+
+Two-stage refinement mode (default):
+
+```bash
+python main.py --feature-layer-mode fast_2layer --enable-two-stage-inference --num-refine-rois 3 --image-score-mode hybrid_global_local
+```
+
+Use single-stage for strict latency benchmarking; use two-stage when tiny/local defect localization quality matters more.
+
+
+## Fast CPU examples
+
+A) Fastest default CPU run (single-pass):
+
+```bash
+python main.py --backbone-model-name edgenext_small.usi_in1k --feature-layer-mode single_last_layer --disable-two-stage-inference
+```
+
+B) `fast_2layer` run:
+
+```bash
+python main.py --feature-layer-mode single_last_layer --disable-two-stage-inference
+```
+
+C) OpenVINO CPU run:
+
+```bash
+python main.py --inference-backend openvino --feature-layer-mode single_last_layer --disable-two-stage-inference
+```
+
+D) Optional fast-mode benchmark:
+
+```bash
+python main.py --benchmark-fast-modes --max-allowed-pixel-auroc-drop 0.01
+```
