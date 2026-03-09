@@ -24,6 +24,7 @@ from timm import create_model
 from tqdm.auto import tqdm
 
 from app.incremental_model import IncrementalADModel
+from app.reporting import DebugReporter, ExperimentTableWriter, LeanMetricsLogger, RunContext
 
 
 SUPPORTED_BACKBONE_MODELS: tuple[str, ...] = (
@@ -80,6 +81,10 @@ class PoCConfig:
     max_anomalous_area_fraction: float = 0.05
     candidate_distance_threshold: float = 3.0
     layers: tuple[int, int, int] = (5, 8, 11)
+    enable_diagnostics: bool = True
+    debug_mode: bool = False
+    save_per_sample_report: bool = False
+    save_plots: bool = False
     num_visualization_examples: int = 5
 
 
@@ -487,8 +492,12 @@ def evaluate(
     test_ds: MVTecMetalNutDataset,
     extractor: FeatureExtractor,
     proto_model: PrototypeAnomalyModel,
-    out_dir: Path,
-) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]]]:
+    vis_dir: Path,
+    *,
+    save_visualizations: bool,
+    num_visualization_examples: int,
+    debug_mode: bool,
+) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]], np.ndarray, np.ndarray]:
     image_labels: list[int] = []
     image_scores: list[float] = []
     pixel_labels: list[np.ndarray] = []
@@ -496,8 +505,8 @@ def evaluate(
     per_sample_rows: list[dict[str, Any]] = []
     per_sample_eval: list[dict[str, Any]] = []
 
-    vis_dir = out_dir / "visualizations"
-    vis_dir.mkdir(parents=True, exist_ok=True)
+    if save_visualizations:
+        vis_dir.mkdir(parents=True, exist_ok=True)
 
     saved_vis = 0
     for idx in tqdm(range(len(test_ds)), desc="Evaluate test set"):
@@ -510,8 +519,35 @@ def evaluate(
         image_scores.append(image_score)
         pixel_labels.append(sample["mask"].astype(np.uint8).ravel())
         pixel_scores.append(anom_map.ravel())
-        per_sample_rows.append(
-            {
+
+        score_thr = float(np.quantile(anom_map, 0.99))
+        pred_area = float(np.mean(anom_map >= score_thr))
+        gt_area = float(np.mean(sample["mask"] > 0))
+        iou = float(
+            np.sum((anom_map >= score_thr) & (sample["mask"] > 0))
+            / (np.sum((anom_map >= score_thr) | (sample["mask"] > 0)) + 1e-8)
+        )
+
+        row = {
+            "image_path": sample["path"],
+            "defect_type": sample["defect_type"],
+            "is_good": int(sample["label"] == 0),
+            "image_score": float(image_score),
+            "image_pred": int(image_score >= score_thr),
+            "image_gt": int(sample["label"]),
+            "max_patch_score": float(np.max(anom_map)),
+            "top1_percent_mean": float(np.mean(np.partition(anom_map.ravel(), -max(1, int(anom_map.size * 0.01)))[-max(1, int(anom_map.size * 0.01)):])) ,
+            "predicted_anomalous_area": pred_area,
+            "gt_anomalous_area": gt_area,
+            "iou_at_threshold": iou,
+            "nearest_prototype_id": -1,
+            "nearest_distance": float(np.min(anom_map)),
+            "time_total_infer": float(infer_sec),
+            "index": idx,
+            "label": sample["label"],
+        }
+        if not debug_mode:
+            row = {
                 "index": idx,
                 "path": sample["path"],
                 "defect_type": sample["defect_type"],
@@ -521,7 +557,8 @@ def evaluate(
                 "map_mean": float(anom_map.mean()),
                 "map_max": float(anom_map.max()),
             }
-        )
+        per_sample_rows.append(row)
+
         per_sample_eval.append(
             {
                 "index": idx,
@@ -533,7 +570,7 @@ def evaluate(
             }
         )
 
-        if saved_vis < 8:
+        if save_visualizations and saved_vis < num_visualization_examples:
             save_visualization(sample, anom_map, vis_dir / f"sample_{idx:03d}.png")
             saved_vis += 1
 
@@ -543,21 +580,10 @@ def evaluate(
         "image_auroc": image_auc,
         "pixel_auroc": pixel_auc,
         "num_test_images": len(test_ds),
-        "mean_infer_time_sec": float(np.mean([r["infer_time_sec"] for r in per_sample_rows])),
-        "std_infer_time_sec": float(np.std([r["infer_time_sec"] for r in per_sample_rows])),
+        "mean_infer_time_sec": float(np.mean([r.get("infer_time_sec", r.get("time_total_infer", 0.0)) for r in per_sample_rows])),
+        "std_infer_time_sec": float(np.std([r.get("infer_time_sec", r.get("time_total_infer", 0.0)) for r in per_sample_rows])),
     }
-    return metrics, per_sample_rows, per_sample_eval
-
-
-def save_per_sample_report(rows: list[dict[str, Any]], out_dir: Path) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    report_path = out_dir / "per_sample_report.csv"
-    if not rows:
-        return
-    with open(report_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+    return metrics, per_sample_rows, per_sample_eval, np.array(image_scores, dtype=np.float32), np.concatenate(pixel_scores)
 
 
 def compute_defect_level_aurocs(rows: list[dict[str, Any]]) -> dict[str, float]:
@@ -769,7 +795,16 @@ def save_metrics(metrics: dict[str, float], out_dir: Path) -> None:
 def run_poc(cfg: PoCConfig) -> dict[str, float]:
     t_all = time.perf_counter()
     set_seed(cfg.seed)
-    setup_project_dirs(cfg)
+
+    ctx = RunContext.start_run(cfg.project_root)
+    lean_logger = LeanMetricsLogger(ctx, enable_diagnostics=cfg.enable_diagnostics)
+    debug_reporter = DebugReporter(
+        ctx,
+        debug_mode=cfg.debug_mode,
+        save_per_sample_report=cfg.save_per_sample_report,
+        save_plots=cfg.save_plots,
+    )
+    experiment_writer = ExperimentTableWriter(cfg.project_root)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -791,11 +826,18 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
     proto_model.fit(train_ds, extractor)
     train_time = time.perf_counter() - t_train
 
-    output_dir = Path(cfg.project_root) / "outputs"
-    proto_model.save(output_dir / "models")
+    proto_model.save(ctx.metrics_dir)
 
     t_eval = time.perf_counter()
-    metrics, per_sample_rows, per_sample_eval = evaluate(test_ds, extractor, proto_model, output_dir)
+    metrics, per_sample_rows, per_sample_eval, image_scores, pixel_scores = evaluate(
+        test_ds,
+        extractor,
+        proto_model,
+        ctx.visualizations_dir,
+        save_visualizations=(cfg.enable_diagnostics and cfg.num_visualization_examples > 0),
+        num_visualization_examples=cfg.num_visualization_examples,
+        debug_mode=cfg.debug_mode,
+    )
     eval_time = time.perf_counter() - t_eval
     total_time = time.perf_counter() - t_all
 
@@ -813,10 +855,8 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
         metrics["effective_num_prototypes"] = int(proto_model.centers.shape[0])
 
     metrics.update(compute_defect_level_aurocs(per_sample_rows))
-    save_per_sample_report(per_sample_rows, output_dir)
 
     per_defect_metrics = compute_per_defect_metrics(per_sample_eval)
-    save_per_defect_metrics(per_defect_metrics, output_dir)
     for row in per_defect_metrics:
         defect = row["defect_type"]
         metrics[f"pixel_auroc_{defect}"] = float(row["pixel_auroc"])
@@ -828,26 +868,127 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
         metrics[f"pixel_recall_{defect}"] = float(row["pixel_recall"])
         metrics[f"pixel_f1_{defect}"] = float(row["pixel_f1"])
 
-    save_metrics(metrics, output_dir)
+    aupro_values = [float(r["aupro"]) for r in per_defect_metrics if not np.isnan(float(r["aupro"]))]
+    aupro_mean = float(np.mean(aupro_values)) if aupro_values else float("nan")
+    image_f1_values = [float(r["image_f1"]) for r in per_defect_metrics]
+    pixel_f1_values = [float(r["pixel_f1"]) for r in per_defect_metrics]
 
-    gallery_path = output_dir / "visualizations" / "final_top5_overlay_gallery.png"
-    save_overlay_gallery(
-        per_sample_rows,
-        test_ds,
-        extractor,
-        proto_model,
-        gallery_path,
-        num_examples=cfg.num_visualization_examples,
+    timing_summary = {
+        "time_feature_extraction_train": float(train_time),
+        "time_transform_fit_or_update": float(train_time),
+        "time_prototype_fit_or_update": float(train_time),
+        "time_eval_total": float(eval_time),
+        "mean_infer_time_sec": float(metrics["mean_infer_time_sec"]),
+    }
+
+    summary = {
+        "run_id": ctx.run_id,
+        "timestamp": ctx.timestamp,
+        "backbone_name": cfg.backbone_model_name,
+        "transform_type": cfg.transform_type,
+        "projection_dim": cfg.projection_dim,
+        "feature_size_factor": cfg.feature_size_factor,
+        "num_prototypes": cfg.num_prototypes,
+        "distance_type": cfg.distance_type,
+        "device_type": str(device),
+        "num_train_images": len(train_ds),
+        "num_test_images": len(test_ds),
+        "image_auroc": float(metrics["image_auroc"]),
+        "pixel_auroc": float(metrics["pixel_auroc"]),
+        "aupro_mean": aupro_mean,
+        "image_f1": float(np.mean(image_f1_values)) if image_f1_values else float("nan"),
+        "pixel_f1": float(np.mean(pixel_f1_values)) if pixel_f1_values else float("nan"),
+        "mean_infer_time_sec": float(metrics["mean_infer_time_sec"]),
+        "total_runtime_sec": float(total_time),
+        "effective_num_prototypes": int(metrics.get("effective_num_prototypes", 0)),
+    }
+
+    lean_logger.log_summary_metrics(summary, summary)
+    lean_logger.log_timing_summary(timing_summary)
+    lean_logger.log_per_defect_metrics(per_defect_metrics)
+
+    if cfg.enable_diagnostics and cfg.debug_mode:
+        debug_reporter.log_per_sample_table(per_sample_rows)
+        if proto_model.inc_model is not None:
+            pmeta = proto_model.inc_model.prototypes.meta
+            status_counts = {"stable": 0, "candidate": 0, "fading": 0}
+            for m in pmeta:
+                status_counts[m.status] = status_counts.get(m.status, 0) + 1
+            prototype_summary = {
+                "prototype_count_total": len(pmeta),
+                "prototype_count_stable": status_counts.get("stable", 0),
+                "prototype_count_candidate": status_counts.get("candidate", 0),
+                "dead_prototypes_count": status_counts.get("fading", 0),
+                "mean_distance_to_nearest_prototype": float(np.mean(image_scores)) if image_scores.size else float("nan"),
+                "mean_distance_to_second_nearest_prototype": float("nan"),
+                "prototype_usage_entropy": float("nan"),
+            }
+            debug_reporter.log_prototype_summary(prototype_summary)
+
+            w = proto_model.inc_model.transformer.whitening
+            z = proto_model.inc_model.transformer.transform(proto_model.inc_model.replay.sample_for_update()) if proto_model.inc_model.replay.sample_for_update().size else np.empty((0, cfg.projection_dim), dtype=np.float32)
+            transform_summary = {
+                "feature_dim_before_transform": int(w.mean.shape[0]) if w.mean is not None else 0,
+                "feature_dim_after_transform": int(cfg.projection_dim),
+                "projected_feature_mean": float(np.mean(z)) if z.size else 0.0,
+                "projected_feature_std": float(np.std(z)) if z.size else 0.0,
+                "running_mean_norm": float(np.linalg.norm(w.mean)) if w.mean is not None else 0.0,
+                "running_var_mean": float(np.mean(w.var)) if w.mean is not None else 0.0,
+                "running_var_std": float(np.std(w.var)) if w.mean is not None else 0.0,
+            }
+            debug_reporter.log_transform_summary(transform_summary)
+
+            replay_comp = proto_model.inc_model.replay.composition()
+            incremental_row = {
+                "update_step": proto_model.inc_model.num_seen_images,
+                "accepted_images": proto_model.inc_model.accepted_images,
+                "rejected_images": proto_model.inc_model.rejected_images,
+                "replay_size": int(sum(replay_comp.values())),
+                "num_candidates": status_counts.get("candidate", 0),
+                "num_promoted": 0,
+                "current_image_auroc": float(metrics["image_auroc"]),
+                "current_pixel_auroc": float(metrics["pixel_auroc"]),
+                "forgetting_delta_image": 0.0,
+                "forgetting_delta_pixel": 0.0,
+            }
+            debug_reporter.log_incremental_update([incremental_row])
+            debug_reporter.log_forgetting_report([incremental_row])
+
+        debug_reporter.create_debug_plots(per_defect_metrics, image_scores, pixel_scores, timing_summary)
+
+    experiment_writer.append_row(
+        {
+            "run_id": ctx.run_id,
+            "timestamp": ctx.timestamp,
+            "backbone_name": cfg.backbone_model_name,
+            "transform_type": cfg.transform_type,
+            "projection_dim": cfg.projection_dim,
+            "feature_size_factor": cfg.feature_size_factor,
+            "num_prototypes": cfg.num_prototypes,
+            "distance_type": cfg.distance_type,
+            "image_auroc": float(metrics["image_auroc"]),
+            "pixel_auroc": float(metrics["pixel_auroc"]),
+            "aupro_mean": aupro_mean,
+            "mean_infer_time_sec": float(metrics["mean_infer_time_sec"]),
+            "total_runtime_sec": float(total_time),
+            "device_type": str(device),
+        }
     )
+
+    if cfg.enable_diagnostics and cfg.num_visualization_examples > 0:
+        gallery_path = ctx.visualizations_dir / "final_top5_overlay_gallery.png"
+        save_overlay_gallery(
+            per_sample_rows,
+            test_ds,
+            extractor,
+            proto_model,
+            gallery_path,
+            num_examples=cfg.num_visualization_examples,
+        )
 
     print("Final metrics:")
     print(json.dumps(metrics, indent=2))
-    print(f"Per-sample report: {output_dir / 'per_sample_report.csv'}")
-    print(f"Per-defect metrics: {output_dir / 'per_defect_metrics.csv'}")
-    if cfg.num_visualization_examples > 0:
-        print(f"Overlay gallery (false-color): {gallery_path}")
-    else:
-        print("Overlay gallery skipped (--num-visualization-examples <= 0).")
+    print(f"Run outputs: {ctx.root_dir}")
     return metrics
 
 
@@ -876,7 +1017,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mahalanobis-alpha", type=float, default=0.7)
     parser.add_argument("--mahalanobis-min-var", type=float, default=1e-6)
     parser.add_argument("--mahalanobis-eps", type=float, default=1e-12)
-    return parser.parse_args()
+    parser.add_argument("--enable-diagnostics", dest="enable_diagnostics", action="store_true", default=True)
+    parser.add_argument("--disable-diagnostics", dest="enable_diagnostics", action="store_false")
+    parser.add_argument("--debug-mode", action="store_true", default=False)
+    parser.add_argument("--save-per-sample-report", action="store_true", default=False)
+    parser.add_argument("--save-plots", action="store_true", default=False)
+    args = parser.parse_args()
+    if args.debug_mode:
+        if not args.save_per_sample_report:
+            args.save_per_sample_report = True
+        if not args.save_plots:
+            args.save_plots = True
+    return args
 
 
 def main() -> None:
@@ -890,6 +1042,10 @@ def main() -> None:
         projection_dim=args.projection_dim,
         projection_seed=args.projection_seed,
         whitening_eps=args.whitening_eps,
+        enable_diagnostics=args.enable_diagnostics,
+        debug_mode=args.debug_mode,
+        save_per_sample_report=args.save_per_sample_report,
+        save_plots=args.save_plots,
         num_visualization_examples=args.num_visualization_examples,
         mahalanobis_alpha=args.mahalanobis_alpha,
         mahalanobis_min_var=args.mahalanobis_min_var,

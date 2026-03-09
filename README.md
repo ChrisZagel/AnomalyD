@@ -1,91 +1,85 @@
-# MVTec AD `metal_nut` PoC for Google Colab
+# AnomalyD
 
-## Kurze Architekturzusammenfassung
+## Project purpose
 
-Dieser Stand nutzt jetzt eine **voll inkrementelle, patch-basierte Anomalieerkennung** ohne PCA:
+Lean, patch-based industrial anomaly detection for MVTec-style data with a frozen backbone and a fully incremental normality model.
 
-1. **Gefrorener Backbone** (timm, keine Gradientenupdates)
-2. **Multi-Level Feature Fusion** (wie bisher)
-3. **Running Whitening** (online Mean/Var, batch-stabil)
-4. **Fixed Random Projection** (einmal initialisiert, dann fix)
-5. **Inkrementelle Prototypen** (stable/candidate/fading)
-6. **Replay Memory** (coverage/boundary/recent)
-7. **Gated Online Updates + periodische Konsolidierung**
+## Main architecture (short)
 
-Pipeline:
+`image -> frozen backbone -> multi-level fused patch features -> running whitening -> fixed random projection -> prototypes -> anomaly score`
 
-`multi-level features -> running whitening -> fixed projection -> prototypes -> distance scoring`
+- no backbone finetuning
+- no PCA
+- incremental updates with replay memory and candidate prototypes
 
----
+## Installation
 
-## Start in Colab
-
-```python
-!git clone <DEIN_REPO_URL>
-%cd AnomalyD
-!pip install -r requirements.txt
-!python main.py --backbone-model-name vit_base_patch14_dinov2.lvd142m
+```bash
+pip install -r requirements.txt
 ```
 
----
+## Dataset setup
 
-## Wichtige CLI-Parameter
+Default run downloads/extracts `metal_nut` into `/content/data/mvtec_ad` if needed.
+You can override paths in `PoCConfig` or adapt CLI usage in notebooks/scripts.
 
-- `--num-prototypes` (Default `512`)
-- `--distance-type` (`l2`, `cosine`, `mahalanobis_diag`)
-- `--projection-type` (`sparse_random_projection`, `gaussian_random_projection`)
-- `--projection-dim` (Default `96`)
-- `--projection-seed` (Default `42`)
-- `--whitening-eps` (Default `1e-6`)
+## Example commands
 
----
+### Normal run (lean diagnostics)
 
-## Neue Kernkomponenten
+```bash
+python main.py --backbone-model-name vit_base_patch14_dinov2.lvd142m --enable-diagnostics
+```
 
-- `IncrementalWhiteningStats`
-- `FixedRandomProjector`
-- `IncrementalWhitenedProjection`
-- `ReplayMemoryManager`
-- `PrototypeStore`
-- `IncrementalADModel`
+### Debug run (extended diagnostics)
 
-Implementiert in `app/incremental_model.py`.
+```bash
+python main.py --debug-mode --save-per-sample-report --save-plots --num-visualization-examples 5
+```
 
----
-
-## Beispielablauf (API)
+### Incremental update run (API)
 
 ```python
 from app.incremental_model import IncrementalADModel
 
-cfg = {
-    "projection_type": "sparse_random_projection",
-    "projection_dim": 96,
-    "distance_type": "l2",
-    "num_prototypes": 512,
-}
-
-model = IncrementalADModel(cfg)
-model.fit_initial(train_patch_features)  # np.ndarray [N, D]
-
-scores = model.predict(test_patch_features)
-
-model.update_incremental([img1_patch_feats, img2_patch_feats])
+model = IncrementalADModel({"projection_dim": 96, "distance_type": "l2", "num_prototypes": 512})
+model.fit_initial(train_patch_features)
+model.update_incremental([new_img_patch_feats])
 model.consolidate()
-
 model.save_state("incremental_state.pkl")
-loaded = IncrementalADModel.load_state("incremental_state.pkl")
 ```
 
----
+## Important parameters
 
-## Outputs
+- `--backbone-model-name`: pretrained timm backbone
+- `--feature-size-factor`: controls processing resolution
+- `--num-prototypes`: prototype capacity in projected space
+- `--distance-type`: `l2`, `cosine`, or `mahalanobis_diag`
+- `--enable-diagnostics/--disable-diagnostics`: on/off diagnostics outputs
+- `--debug-mode`: enables richer diagnostics
 
-Unter `/content/project/outputs/`:
+## Output folder structure
 
-- `metrics.json` / `metrics.csv`
-- `per_sample_report.csv`
-- `per_defect_metrics.csv`
-- `models/prototype_model.pkl` (inkl. inkrementellem State)
-- `visualizations/*.png`
-- `visualizations/final_top5_overlay_gallery.png`
+Each run writes to:
+
+`/content/project/outputs/<run_id>/`
+
+Subfolders:
+- `metrics/`
+- `tables/`
+- `plots/`
+- `visualizations/`
+
+Global comparison table:
+- `/content/project/outputs/experiment_results.csv`
+
+## Compare experiments
+
+Use `experiment_results.csv` to compare runs by backbone, transform config, AUROC/AUPRO, and runtime in a single table.
+
+## How to extend the system
+
+- add new distance functions in `PrototypeStore`
+- add new replay policies in `ReplayMemoryManager`
+- keep hot path lean; add expensive diagnostics only behind `debug_mode`
+- document architecture changes in `ARCHITECTURE.md`
