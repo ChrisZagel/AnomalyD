@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import random
 import shutil
@@ -105,6 +106,7 @@ class PoCConfig:
     save_per_sample_report: bool = False
     save_plots: bool = False
     num_visualization_examples: int = 5
+    eval_batch_size: int = 4
 
 
 class MVTecMetalNutDataset:
@@ -329,6 +331,7 @@ class FeatureExtractor:
         maps = self._select_maps(list(maps), layer_mode)
         target_hw = maps[-1].shape[-2:]
 
+        target_hw = maps[-1].shape[-2:]
         norm_maps = []
         for fmap in maps:
             if fmap.shape[-2:] != target_hw:
@@ -346,6 +349,109 @@ class FeatureExtractor:
             }
             return patch_feats.cpu().numpy(), (h, w), (work_h, work_w), timing
         return patch_feats.cpu().numpy(), (h, w), (work_h, work_w)
+
+    @torch.no_grad()
+    def extract_patch_features_batch(
+        self,
+        images: list[Image.Image],
+        *,
+        feature_size_factor: float | None = None,
+        feature_layer_mode: str | None = None,
+        return_timing: bool = False,
+    ) -> list[tuple[np.ndarray, tuple[int, int], tuple[int, int]]] | list[tuple[np.ndarray, tuple[int, int], tuple[int, int], dict[str, float]]]:
+        if not images:
+            return []
+
+        fsf = self.cfg.feature_size_factor if feature_size_factor is None else feature_size_factor
+        layer_mode = self.cfg.feature_layer_mode if feature_layer_mode is None else feature_layer_mode
+
+        tensors: list[torch.Tensor] = []
+        work_sizes: list[tuple[int, int]] = []
+        for image in images:
+            tensor = self.transform(image)
+            orig_h, orig_w = tensor.shape[-2:]
+            if fsf != 1.0:
+                work_h = max(14, int(round(orig_h * fsf / 14) * 14))
+                work_w = max(14, int(round(orig_w * fsf / 14) * 14))
+                tensor = F.interpolate(
+                    tensor.unsqueeze(0),
+                    size=(work_h, work_w),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+            else:
+                work_h, work_w = orig_h, orig_w
+            tensors.append(tensor)
+            work_sizes.append((work_h, work_w))
+
+        if len(set(work_sizes)) != 1:
+            out: list[Any] = []
+            for image in images:
+                out.append(
+                    self.extract_patch_features(
+                        image,
+                        feature_size_factor=feature_size_factor,
+                        feature_layer_mode=feature_layer_mode,
+                        return_timing=return_timing,
+                    )
+                )
+            return out
+
+        batch = torch.stack(tensors, dim=0).to(self.device)
+
+        t0 = time.perf_counter()
+        if self.inference_backend == "openvino":
+            try:
+                self._ensure_openvino(tuple(batch.shape))
+                assert self._ov_compiled is not None and self._ov_input_name is not None
+                outputs = self._ov_compiled({self._ov_input_name: batch.detach().cpu().numpy()})
+                if isinstance(outputs, dict):
+                    ordered_keys = sorted(outputs.keys(), key=lambda k: str(k))
+                    maps = [torch.from_numpy(outputs[k]).to(self.device) for k in ordered_keys]
+                else:
+                    maps = [torch.from_numpy(o).to(self.device) for o in outputs]
+            except Exception as exc:
+                warnings.warn(
+                    f"OpenVINO backend unavailable ({exc}). Falling back to pytorch backend for this run.",
+                    RuntimeWarning,
+                )
+                self.inference_backend = "pytorch"
+                maps = self.backbone(batch)
+        else:
+            maps = self.backbone(batch)
+        t1 = time.perf_counter()
+
+        maps = self._select_maps(list(maps), layer_mode)
+        target_hw = maps[-1].shape[-2:]
+        norm_maps = []
+        for fmap in maps:
+            if fmap.shape[-2:] != target_hw:
+                fmap = F.interpolate(fmap, size=target_hw, mode="bilinear", align_corners=False)
+            fmap = F.normalize(fmap, p=2, dim=1)
+            norm_maps.append(fmap)
+
+        fused = torch.cat(norm_maps, dim=1)
+        b, c, h, w = fused.shape
+        patch_feats = fused.permute(0, 2, 3, 1).reshape(b, h * w, c).cpu().numpy()
+        t2 = time.perf_counter()
+
+        out: list[Any] = []
+        for i in range(b):
+            if return_timing:
+                out.append(
+                    (
+                        patch_feats[i],
+                        (h, w),
+                        work_sizes[i],
+                        {
+                            "time_backbone_forward_eval": float(t1 - t0) / b,
+                            "time_feature_fusion_eval": float(t2 - t1) / b,
+                        },
+                    )
+                )
+            else:
+                out.append((patch_feats[i], (h, w), work_sizes[i]))
+        return out
 
 
 class PrototypeAnomalyModel:
@@ -1095,6 +1201,21 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
     proto_model.fit(train_ds, extractor)
     extractor.inference_backend = original_backend
     train_time = time.perf_counter() - t_train
+    train_backbone = float(proto_model.fit_timing.get("time_backbone_forward_train", 0.0))
+    train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
+    train_proto_t = float(proto_model.fit_timing.get("time_prototype_update_train", 0.0))
+
+    train_backbone = float(proto_model.fit_timing.get("time_backbone_forward_train", 0.0))
+    train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
+    train_proto_t = float(proto_model.fit_timing.get("time_prototype_update_train", 0.0))
+
+    train_backbone = float(proto_model.fit_timing.get("time_backbone_forward_train", 0.0))
+    train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
+    train_proto_t = float(proto_model.fit_timing.get("time_prototype_update_train", 0.0))
+
+    train_backbone = float(proto_model.fit_timing.get("time_backbone_forward_train", 0.0))
+    train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
+    train_proto_t = float(proto_model.fit_timing.get("time_prototype_update_train", 0.0))
 
     train_backbone = float(proto_model.fit_timing.get("time_backbone_forward_train", 0.0))
     train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
@@ -1362,6 +1483,7 @@ def main() -> None:
         save_per_sample_report=args.save_per_sample_report,
         save_plots=args.save_plots,
         num_visualization_examples=args.num_visualization_examples,
+        eval_batch_size=args.eval_batch_size,
         mahalanobis_alpha=args.mahalanobis_alpha,
         mahalanobis_min_var=args.mahalanobis_min_var,
         mahalanobis_eps=args.mahalanobis_eps,
