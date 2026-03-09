@@ -94,12 +94,12 @@ Use `experiment_results.csv` to compare runs by backbone, transform config, AURO
 Normal diagnostics stay lightweight; debug mode is intended for deeper analysis.
 
 
-## Single-stage vs two-stage commands
+## Single-stage vs two-stage commands (optional two-stage)
 
 Fast single-stage baseline:
 
 ```bash
-python main.py --feature-layer-mode fast_2layer --disable-two-stage-inference
+python main.py --feature-layer-mode single_last_layer --disable-two-stage-inference
 ```
 
 Two-stage refinement mode (default):
@@ -109,3 +109,30 @@ python main.py --feature-layer-mode fast_2layer --enable-two-stage-inference --n
 ```
 
 Use single-stage for strict latency benchmarking; use two-stage when tiny/local defect localization quality matters more.
+
+
+## Fast CPU examples
+
+A) Fastest default CPU run (single-pass):
+
+```bash
+python main.py --backbone-model-name edgenext_small.usi_in1k --feature-layer-mode single_last_layer --disable-two-stage-inference
+```
+
+B) `fast_2layer` run:
+
+```bash
+python main.py --feature-layer-mode single_last_layer --disable-two-stage-inference
+```
+
+C) OpenVINO CPU run:
+
+```bash
+python main.py --inference-backend openvino --feature-layer-mode single_last_layer --disable-two-stage-inference
+```
+
+D) Optional fast-mode benchmark:
+
+```bash
+python main.py --benchmark-fast-modes --max-allowed-pixel-auroc-drop 0.01
+```

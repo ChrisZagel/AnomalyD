@@ -100,7 +100,7 @@ Main classes:
 ## 12) Single-stage vs two-stage inference
 
 - **Single-stage**: full-image pass only (fast baseline, lower local refinement quality).
-- **Two-stage** (default):
+- **Two-stage** (optional):
   1. Stage A global screening at `feature_size_factor=0.75` using `feature_layer_mode=fast_2layer`.
   2. ROI proposal from coarse anomaly map (top maxima + lightweight overlap suppression).
   3. Stage B selective ROI refinement at `refine_feature_size_factor=1.0`.
@@ -110,5 +110,29 @@ This keeps average runtime low (no full-image high-res pass) while improving tin
 
 ## 13) Feature layer modes
 
-- `fast_2layer` (default): mid+late features only, lower backbone-side feature processing cost.
+- `single_last_layer` (default): last spatial layer only, fastest.
+- `fast_2layer`: mid+late compromise mode.
 - `full_3layer`: previous richer fusion mode for comparison.
+
+
+## 14) Production speed path (single-pass)
+
+Default production executes one pass per image:
+preprocess -> one backbone forward -> selected feature fusion -> whitening/projection -> prototype scoring -> anomaly map -> image score.
+
+- `enable_two_stage_inference=False` by default.
+- extra comparison/ablation loops are disabled by default.
+
+## 15) Fast feature-layer modes
+
+- `single_last_layer` (default, fastest)
+- `fast_2layer`
+- `full_3layer` (highest feature richness)
+
+## 16) OpenVINO CPU backend
+
+`inference_backend` supports:
+- `pytorch` (default)
+- `openvino` (CPU)
+
+OpenVINO path exports the backbone feature extractor to ONNX (fixed input shape per run) and keeps downstream whitening/prototype scoring unchanged.
