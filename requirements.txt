@@ -8,3 +8,7 @@ matplotlib
 tqdm
 opencv-python-headless
 scipy
+
+openvino
+onnx
+onnxscript
