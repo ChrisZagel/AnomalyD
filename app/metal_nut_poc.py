@@ -19,11 +19,12 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from PIL import Image
 from scipy.ndimage import gaussian_filter, label as cc_label
-from sklearn.cluster import MiniBatchKMeans
-from sklearn.decomposition import PCA
 from sklearn.metrics import precision_recall_curve, precision_recall_fscore_support, roc_auc_score
 from timm import create_model
 from tqdm.auto import tqdm
+
+from app.incremental_model import IncrementalADModel
+from app.reporting import DebugReporter, ExperimentTableWriter, LeanMetricsLogger, RunContext
 
 
 SUPPORTED_BACKBONE_MODELS: tuple[str, ...] = (
@@ -49,9 +50,14 @@ class PoCConfig:
     project_root: str = "/content/project"
     backbone_model_name: str = "vit_base_patch14_dinov2.lvd142m"
     feature_size_factor: float = 0.75
-    num_prototypes: int = 256
-    pca_dim: int = 128
-    distance_type: str = "cosine"
+    num_prototypes: int = 512
+    transform_type: str = "running_whiten_fixed_proj"
+    projection_type: str = "sparse_random_projection"
+    projection_dim: int = 96
+    projection_seed: int = 42
+    whitening_eps: float = 1e-6
+    use_whitening: bool = True
+    distance_type: str = "l2"
     mahalanobis_alpha: float = 0.7
     mahalanobis_min_var: float = 1e-6
     mahalanobis_eps: float = 1e-12
@@ -61,7 +67,24 @@ class PoCConfig:
     use_gaussian_smoothing: bool = True
     gaussian_sigma: float = 2.0
     max_pca_samples: int = 120_000
+    max_replay_features: int = 200_000
+    coverage_fraction: float = 0.5
+    boundary_fraction: float = 0.25
+    recent_fraction: float = 0.25
+    update_trigger_images: int = 20
+    candidate_promotion_hits: int = 5
+    threshold_beta: float = 0.8
+    prototype_forget_patience: int = 5000
+    rollback_enabled: bool = True
+    update_accept_quantile: float = 0.99
+    max_patch_score_threshold: float = 3.5
+    max_anomalous_area_fraction: float = 0.05
+    candidate_distance_threshold: float = 3.0
     layers: tuple[int, int, int] = (5, 8, 11)
+    enable_diagnostics: bool = True
+    debug_mode: bool = False
+    save_per_sample_report: bool = False
+    save_plots: bool = False
     num_visualization_examples: int = 5
 
 
@@ -218,122 +241,17 @@ class FeatureExtractor:
 class PrototypeAnomalyModel:
     def __init__(self, cfg: PoCConfig) -> None:
         self.cfg = cfg
-        self.pca: PCA | None = None
+        self.inc_model: IncrementalADModel | None = None
         self.centers: np.ndarray | None = None
         self.mahalanobis_means: np.ndarray | None = None
         self.mahalanobis_vars: np.ndarray | None = None
-        self.mahalanobis_global_var: np.ndarray | None = None
+        self.fit_timing: dict[str, float] = {}
 
     @staticmethod
     def _resolve_num_clusters(requested: int, n_samples: int) -> int:
         if n_samples <= 0:
             raise ValueError("No training samples available for clustering.")
         return max(1, min(requested, n_samples))
-
-    @staticmethod
-    def _chunked_assign_to_centers(x: np.ndarray, centers: np.ndarray, chunk_size: int = 8192) -> np.ndarray:
-        assigns: list[np.ndarray] = []
-        c2 = np.sum(centers**2, axis=1)[None, :]
-        for i in range(0, x.shape[0], chunk_size):
-            chunk = x[i : i + chunk_size]
-            d2 = np.sum(chunk**2, axis=1, keepdims=True) + c2 - 2.0 * chunk @ centers.T
-            assigns.append(np.argmin(d2, axis=1).astype(np.int64))
-        return np.concatenate(assigns, axis=0)
-
-    def _fit_mahalanobis_diag_stats(self, train_feats_red: np.ndarray, kmeans_centers: np.ndarray) -> None:
-        assigns = self._chunked_assign_to_centers(train_feats_red, kmeans_centers)
-        n_clusters = kmeans_centers.shape[0]
-        dim = train_feats_red.shape[1]
-
-        counts = np.bincount(assigns, minlength=n_clusters).astype(np.float64)
-        sums = np.zeros((n_clusters, dim), dtype=np.float64)
-        sums_sq = np.zeros((n_clusters, dim), dtype=np.float64)
-
-        np.add.at(sums, assigns, train_feats_red)
-        np.add.at(sums_sq, assigns, train_feats_red * train_feats_red)
-
-        global_var = np.var(train_feats_red, axis=0).astype(np.float32)
-        means = kmeans_centers.astype(np.float32).copy()
-        local_var = np.zeros((n_clusters, dim), dtype=np.float32)
-
-        non_empty = counts > 0
-        if np.any(non_empty):
-            means[non_empty] = (sums[non_empty] / counts[non_empty, None]).astype(np.float32)
-            ex2 = sums_sq[non_empty] / counts[non_empty, None]
-            var = ex2 - np.square(means[non_empty], dtype=np.float64)
-            local_var[non_empty] = np.clip(var, a_min=0.0, a_max=None).astype(np.float32)
-
-        if np.any(~non_empty):
-            local_var[~non_empty] = global_var
-
-        alpha = float(self.cfg.mahalanobis_alpha)
-        reg_var = alpha * local_var + (1.0 - alpha) * global_var[None, :]
-        reg_var = np.clip(reg_var, a_min=float(self.cfg.mahalanobis_min_var), a_max=None).astype(np.float32)
-
-        self.mahalanobis_means = means
-        self.mahalanobis_vars = reg_var
-        self.mahalanobis_global_var = global_var
-
-    def fit(self, dataset: MVTecMetalNutDataset, extractor: FeatureExtractor) -> None:
-        pca_samples = []
-        for sample in tqdm(dataset.samples, desc="Collect features for PCA"):
-            image = Image.open(sample).convert("RGB")
-            feats, _, _ = extractor.extract_patch_features(image)
-            pca_samples.append(feats)
-
-        all_feats = np.concatenate(pca_samples, axis=0)
-        if all_feats.shape[0] > self.cfg.max_pca_samples:
-            idx = np.random.choice(all_feats.shape[0], self.cfg.max_pca_samples, replace=False)
-            all_feats = all_feats[idx]
-
-        self.pca = PCA(n_components=self.cfg.pca_dim, random_state=self.cfg.seed)
-        self.pca.fit(all_feats)
-
-        reduced_train_feats = []
-        for sample in tqdm(dataset.samples, desc="Fit prototypes"):
-            image = Image.open(sample).convert("RGB")
-            feats, _, _ = extractor.extract_patch_features(image)
-            feats_red = self.pca.transform(feats)
-            reduced_train_feats.append(feats_red.astype(np.float32))
-
-        all_train_red = np.concatenate(reduced_train_feats, axis=0)
-        effective_clusters = self._resolve_num_clusters(self.cfg.num_prototypes, all_train_red.shape[0])
-        if effective_clusters != self.cfg.num_prototypes:
-            print(
-                f"[WARN] Reducing num_prototypes from {self.cfg.num_prototypes} to {effective_clusters} "
-                f"because only {all_train_red.shape[0]} reduced patch samples are available."
-            )
-
-        kmeans = MiniBatchKMeans(
-            n_clusters=effective_clusters,
-            random_state=self.cfg.seed,
-            batch_size=4096,
-            n_init="auto",
-        )
-        kmeans.fit(all_train_red)
-
-        self.centers = kmeans.cluster_centers_.astype(np.float32)
-
-        if self.cfg.distance_type == "mahalanobis_diag":
-            self._fit_mahalanobis_diag_stats(all_train_red.astype(np.float32), self.centers)
-
-    def save(self, output_dir: Path) -> None:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        if self.pca is None or self.centers is None:
-            raise RuntimeError("Model is not fitted yet.")
-
-        import pickle
-
-        payload = {
-            "config": asdict(self.cfg),
-            "pca": self.pca,
-            "centers": self.centers,
-            "mahalanobis_means": self.mahalanobis_means,
-            "mahalanobis_vars": self.mahalanobis_vars,
-            "mahalanobis_global_var": self.mahalanobis_global_var,
-        }
-        with open(output_dir / "prototype_model.pkl", "wb") as f:
-            pickle.dump(payload, f)
 
     def _chunked_min_distance(self, x: np.ndarray, centers: np.ndarray, chunk_size: int = 8192) -> np.ndarray:
         mins = []
@@ -347,17 +265,13 @@ class PrototypeAnomalyModel:
         elif self.cfg.distance_type == "l2":
             for i in range(0, x.shape[0], chunk_size):
                 chunk = x[i : i + chunk_size]
-                d2 = (
-                    np.sum(chunk**2, axis=1, keepdims=True)
-                    + np.sum(centers**2, axis=1)[None, :]
-                    - 2.0 * chunk @ centers.T
-                )
+                d2 = np.sum(chunk**2, axis=1, keepdims=True) + np.sum(centers**2, axis=1)[None, :] - 2.0 * chunk @ centers.T
                 mins.append(np.sqrt(np.clip(np.min(d2, axis=1), a_min=0.0, a_max=None)))
         elif self.cfg.distance_type == "mahalanobis_diag":
-            if self.mahalanobis_means is None or self.mahalanobis_vars is None:
-                raise RuntimeError("Mahalanobis statistics are not available. Fit model with distance_type='mahalanobis_diag'.")
-            means = self.mahalanobis_means
+            means = self.mahalanobis_means if self.mahalanobis_means is not None else centers
             vars_ = self.mahalanobis_vars
+            if vars_ is None:
+                raise RuntimeError("Mahalanobis statistics are not available.")
             eps = float(self.cfg.mahalanobis_eps)
             for i in range(0, x.shape[0], chunk_size):
                 chunk = x[i : i + chunk_size]
@@ -368,18 +282,74 @@ class PrototypeAnomalyModel:
             raise ValueError(f"Unsupported distance_type: {self.cfg.distance_type}")
         return np.concatenate(mins, axis=0)
 
+    def _build_inc_config(self) -> dict[str, Any]:
+        return {
+            "whitening_eps": self.cfg.whitening_eps,
+            "projection_dim": self.cfg.projection_dim,
+            "projection_type": self.cfg.projection_type,
+            "projection_seed": self.cfg.projection_seed,
+            "num_prototypes": self.cfg.num_prototypes,
+            "distance_type": self.cfg.distance_type,
+            "mahalanobis_eps": self.cfg.mahalanobis_eps,
+            "candidate_promotion_hits": self.cfg.candidate_promotion_hits,
+            "prototype_forget_patience": self.cfg.prototype_forget_patience,
+            "max_replay_features": self.cfg.max_replay_features,
+            "coverage_fraction": self.cfg.coverage_fraction,
+            "boundary_fraction": self.cfg.boundary_fraction,
+            "recent_fraction": self.cfg.recent_fraction,
+            "update_trigger_images": self.cfg.update_trigger_images,
+            "threshold_beta": self.cfg.threshold_beta,
+            "update_accept_quantile": self.cfg.update_accept_quantile,
+            "max_patch_score_threshold": self.cfg.max_patch_score_threshold,
+            "max_anomalous_area_fraction": self.cfg.max_anomalous_area_fraction,
+            "candidate_distance_threshold": self.cfg.candidate_distance_threshold,
+        }
+
+    def fit(self, dataset: MVTecMetalNutDataset, extractor: FeatureExtractor) -> None:
+        train_feats = []
+        t_backbone = 0.0
+        for sample in tqdm(dataset.samples, desc="Collect features for incremental model"):
+            image = Image.open(sample).convert("RGB")
+            t0 = time.perf_counter()
+            feats, _, _ = extractor.extract_patch_features(image)
+            t_backbone += float(time.perf_counter() - t0)
+            train_feats.append(feats.astype(np.float32))
+
+        all_feats = np.concatenate(train_feats, axis=0)
+        if all_feats.shape[0] > self.cfg.max_pca_samples:
+            idx = np.random.choice(all_feats.shape[0], self.cfg.max_pca_samples, replace=False)
+            all_feats = all_feats[idx]
+
+        self.inc_model = IncrementalADModel(self._build_inc_config())
+        self.inc_model.fit_initial(all_feats)
+        self.centers = self.inc_model.prototypes.means
+        self.fit_timing = {"time_backbone_forward_train": t_backbone, **self.inc_model.last_fit_timing}
+
+    def save(self, output_dir: Path) -> None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if self.inc_model is None:
+            raise RuntimeError("Model is not fitted yet.")
+        payload = {
+            "config": asdict(self.cfg),
+            "incremental_state": self.inc_model.state_dict(),
+            "centers": self.inc_model.prototypes.means,
+        }
+        import pickle
+
+        with open(output_dir / "prototype_model.pkl", "wb") as f:
+            pickle.dump(payload, f)
+
     def infer_map(
         self,
         image: Image.Image,
         extractor: FeatureExtractor,
         orig_size: tuple[int, int],
     ) -> tuple[np.ndarray, float]:
-        if self.pca is None or self.centers is None:
+        if self.inc_model is None:
             raise RuntimeError("Model is not fitted yet.")
 
         feats, grid_hw, work_hw = extractor.extract_patch_features(image)
-        feats_red = self.pca.transform(feats)
-        patch_scores = self._chunked_min_distance(feats_red.astype(np.float32), self.centers)
+        patch_scores = self.inc_model.predict(feats.astype(np.float32))
 
         token_map = patch_scores.reshape(grid_hw)
         token_map_t = torch.from_numpy(token_map).unsqueeze(0).unsqueeze(0).float()
@@ -393,7 +363,6 @@ class PrototypeAnomalyModel:
         image_score = float(np.mean(np.partition(full_map.ravel(), -topk)[-topk:]))
         return full_map, image_score
 
-
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -402,8 +371,9 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _get_pca_seen_samples(pca_obj: PCA) -> int:
-    """Return number of seen samples for sklearn PCA/IncrementalPCA compatibility."""
+
+
+def _get_pca_seen_samples(pca_obj: Any) -> int:
     n_seen = getattr(pca_obj, "n_samples_seen_", None)
     if n_seen is not None:
         return int(n_seen)
@@ -411,7 +381,6 @@ def _get_pca_seen_samples(pca_obj: PCA) -> int:
     if n_samples is not None:
         return int(n_samples)
     return 0
-
 
 def setup_project_dirs(cfg: PoCConfig) -> dict[str, Path]:
     project_root = Path(cfg.project_root)
@@ -528,8 +497,12 @@ def evaluate(
     test_ds: MVTecMetalNutDataset,
     extractor: FeatureExtractor,
     proto_model: PrototypeAnomalyModel,
-    out_dir: Path,
-) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]]]:
+    vis_dir: Path,
+    *,
+    save_visualizations: bool,
+    num_visualization_examples: int,
+    debug_mode: bool,
+) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]], np.ndarray, np.ndarray, dict[str, float]]:
     image_labels: list[int] = []
     image_scores: list[float] = []
     pixel_labels: list[np.ndarray] = []
@@ -537,22 +510,69 @@ def evaluate(
     per_sample_rows: list[dict[str, Any]] = []
     per_sample_eval: list[dict[str, Any]] = []
 
-    vis_dir = out_dir / "visualizations"
-    vis_dir.mkdir(parents=True, exist_ok=True)
+    if save_visualizations:
+        vis_dir.mkdir(parents=True, exist_ok=True)
 
     saved_vis = 0
+    t_backbone = 0.0
+    t_transform = 0.0
+    t_distance = 0.0
+    t_post = 0.0
     for idx in tqdm(range(len(test_ds)), desc="Evaluate test set"):
         sample = test_ds[idx]
         t0 = time.perf_counter()
-        anom_map, image_score = proto_model.infer_map(sample["image"], extractor, sample["orig_size"])
-        infer_sec = time.perf_counter() - t0
+        feats, grid_hw, work_hw = extractor.extract_patch_features(sample["image"])
+        t1 = time.perf_counter()
+        patch_scores = proto_model.inc_model.predict(feats.astype(np.float32)) if proto_model.inc_model is not None else np.zeros((grid_hw[0] * grid_hw[1],), dtype=np.float32)
+        t2 = time.perf_counter()
+        token_map = patch_scores.reshape(grid_hw)
+        token_map_t = torch.from_numpy(token_map).unsqueeze(0).unsqueeze(0).float()
+        work_map = F.interpolate(token_map_t, size=work_hw, mode="bilinear", align_corners=False)
+        anom_map = F.interpolate(work_map, size=sample["orig_size"], mode="bilinear", align_corners=False)[0, 0].numpy()
+        if proto_model.cfg.use_gaussian_smoothing:
+            anom_map = gaussian_filter(anom_map, sigma=proto_model.cfg.gaussian_sigma)
+        topk = max(1, int(anom_map.size * proto_model.cfg.topk_percent / 100.0))
+        image_score = float(np.mean(np.partition(anom_map.ravel(), -topk)[-topk:]))
+        t3 = time.perf_counter()
+        infer_sec = t3 - t0
+        t_backbone += float(t1 - t0)
+        t_transform += 0.0
+        t_distance += float(t2 - t1)
+        t_post += float(t3 - t2)
 
         image_labels.append(sample["label"])
         image_scores.append(image_score)
         pixel_labels.append(sample["mask"].astype(np.uint8).ravel())
         pixel_scores.append(anom_map.ravel())
-        per_sample_rows.append(
-            {
+
+        score_thr = float(np.quantile(anom_map, 0.99))
+        pred_area = float(np.mean(anom_map >= score_thr))
+        gt_area = float(np.mean(sample["mask"] > 0))
+        iou = float(
+            np.sum((anom_map >= score_thr) & (sample["mask"] > 0))
+            / (np.sum((anom_map >= score_thr) | (sample["mask"] > 0)) + 1e-8)
+        )
+
+        row = {
+            "image_path": sample["path"],
+            "defect_type": sample["defect_type"],
+            "is_good": int(sample["label"] == 0),
+            "image_score": float(image_score),
+            "image_pred": int(image_score >= score_thr),
+            "image_gt": int(sample["label"]),
+            "max_patch_score": float(np.max(anom_map)),
+            "top1_percent_mean": float(np.mean(np.partition(anom_map.ravel(), -max(1, int(anom_map.size * 0.01)))[-max(1, int(anom_map.size * 0.01)):])) ,
+            "predicted_anomalous_area": pred_area,
+            "gt_anomalous_area": gt_area,
+            "iou_at_threshold": iou,
+            "nearest_prototype_id": -1,
+            "nearest_distance": float(np.min(anom_map)),
+            "time_total_infer": float(infer_sec),
+            "index": idx,
+            "label": sample["label"],
+        }
+        if not debug_mode:
+            row = {
                 "index": idx,
                 "path": sample["path"],
                 "defect_type": sample["defect_type"],
@@ -562,7 +582,8 @@ def evaluate(
                 "map_mean": float(anom_map.mean()),
                 "map_max": float(anom_map.max()),
             }
-        )
+        per_sample_rows.append(row)
+
         per_sample_eval.append(
             {
                 "index": idx,
@@ -574,7 +595,7 @@ def evaluate(
             }
         )
 
-        if saved_vis < 8:
+        if save_visualizations and saved_vis < num_visualization_examples:
             save_visualization(sample, anom_map, vis_dir / f"sample_{idx:03d}.png")
             saved_vis += 1
 
@@ -584,21 +605,11 @@ def evaluate(
         "image_auroc": image_auc,
         "pixel_auroc": pixel_auc,
         "num_test_images": len(test_ds),
-        "mean_infer_time_sec": float(np.mean([r["infer_time_sec"] for r in per_sample_rows])),
-        "std_infer_time_sec": float(np.std([r["infer_time_sec"] for r in per_sample_rows])),
+        "mean_infer_time_sec": float(np.mean([r.get("infer_time_sec", r.get("time_total_infer", 0.0)) for r in per_sample_rows])),
+        "std_infer_time_sec": float(np.std([r.get("infer_time_sec", r.get("time_total_infer", 0.0)) for r in per_sample_rows])),
     }
-    return metrics, per_sample_rows, per_sample_eval
-
-
-def save_per_sample_report(rows: list[dict[str, Any]], out_dir: Path) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    report_path = out_dir / "per_sample_report.csv"
-    if not rows:
-        return
-    with open(report_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+    timing = {"time_backbone_forward_eval": t_backbone, "time_transform_eval": t_transform, "time_distance_eval": t_distance, "time_postprocess_eval": t_post}
+    return metrics, per_sample_rows, per_sample_eval, np.array(image_scores, dtype=np.float32), np.concatenate(pixel_scores), timing
 
 
 def compute_defect_level_aurocs(rows: list[dict[str, Any]]) -> dict[str, float]:
@@ -810,7 +821,17 @@ def save_metrics(metrics: dict[str, float], out_dir: Path) -> None:
 def run_poc(cfg: PoCConfig) -> dict[str, float]:
     t_all = time.perf_counter()
     set_seed(cfg.seed)
-    setup_project_dirs(cfg)
+
+    ctx = RunContext.start_run(cfg.project_root)
+    lean_logger = LeanMetricsLogger(ctx, enable_diagnostics=cfg.enable_diagnostics)
+    debug_reporter = DebugReporter(
+        ctx,
+        enable_diagnostics=cfg.enable_diagnostics,
+        debug_mode=cfg.debug_mode,
+        save_per_sample_report=cfg.save_per_sample_report,
+        save_plots=cfg.save_plots,
+    )
+    experiment_writer = ExperimentTableWriter(cfg.project_root)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -831,12 +852,22 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
     t_train = time.perf_counter()
     proto_model.fit(train_ds, extractor)
     train_time = time.perf_counter() - t_train
+    train_backbone = float(proto_model.fit_timing.get("time_backbone_forward_train", 0.0))
+    train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
+    train_proto_t = float(proto_model.fit_timing.get("time_prototype_update_train", 0.0))
 
-    output_dir = Path(cfg.project_root) / "outputs"
-    proto_model.save(output_dir / "models")
+    proto_model.save(ctx.metrics_dir)
 
     t_eval = time.perf_counter()
-    metrics, per_sample_rows, per_sample_eval = evaluate(test_ds, extractor, proto_model, output_dir)
+    metrics, per_sample_rows, per_sample_eval, image_scores, pixel_scores, eval_timing = evaluate(
+        test_ds,
+        extractor,
+        proto_model,
+        ctx.visualizations_dir,
+        save_visualizations=(cfg.enable_diagnostics and cfg.num_visualization_examples > 0),
+        num_visualization_examples=cfg.num_visualization_examples,
+        debug_mode=cfg.debug_mode,
+    )
     eval_time = time.perf_counter() - t_eval
     total_time = time.perf_counter() - t_all
 
@@ -850,17 +881,12 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
         }
     )
 
-    if proto_model.pca is not None:
-        metrics["pca_explained_variance_ratio_sum"] = float(np.sum(proto_model.pca.explained_variance_ratio_))
-        metrics["pca_seen_samples"] = _get_pca_seen_samples(proto_model.pca)
     if proto_model.centers is not None:
         metrics["effective_num_prototypes"] = int(proto_model.centers.shape[0])
 
     metrics.update(compute_defect_level_aurocs(per_sample_rows))
-    save_per_sample_report(per_sample_rows, output_dir)
 
     per_defect_metrics = compute_per_defect_metrics(per_sample_eval)
-    save_per_defect_metrics(per_defect_metrics, output_dir)
     for row in per_defect_metrics:
         defect = row["defect_type"]
         metrics[f"pixel_auroc_{defect}"] = float(row["pixel_auroc"])
@@ -872,35 +898,175 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
         metrics[f"pixel_recall_{defect}"] = float(row["pixel_recall"])
         metrics[f"pixel_f1_{defect}"] = float(row["pixel_f1"])
 
-    save_metrics(metrics, output_dir)
+    aupro_values = [float(r["aupro"]) for r in per_defect_metrics if not np.isnan(float(r["aupro"]))]
+    aupro_mean = float(np.mean(aupro_values)) if aupro_values else float("nan")
+    image_f1_values = [float(r["image_f1"]) for r in per_defect_metrics]
+    pixel_f1_values = [float(r["pixel_f1"]) for r in per_defect_metrics]
 
-    gallery_path = output_dir / "visualizations" / "final_top5_overlay_gallery.png"
-    save_overlay_gallery(
-        per_sample_rows,
-        test_ds,
-        extractor,
-        proto_model,
-        gallery_path,
-        num_examples=cfg.num_visualization_examples,
+    timing_summary = {
+        "time_feature_extraction_train": float(train_backbone),
+        "time_transform_fit_or_update": float(train_transform_t),
+        "time_prototype_fit_or_update": float(train_proto_t),
+        "time_backbone_forward_train": float(train_backbone),
+        "time_transform_update_train": float(train_transform_t),
+        "time_prototype_update_train": float(train_proto_t),
+        "time_eval_total": float(eval_time),
+        "time_backbone_forward_eval": float(eval_timing.get("time_backbone_forward_eval", 0.0)),
+        "time_transform_eval": float(eval_timing.get("time_transform_eval", 0.0)),
+        "time_distance_eval": float(eval_timing.get("time_distance_eval", 0.0)),
+        "time_postprocess_eval": float(eval_timing.get("time_postprocess_eval", 0.0)),
+        "mean_infer_time_sec": float(metrics["mean_infer_time_sec"]),
+    }
+
+    summary = {
+        "run_id": ctx.run_id,
+        "timestamp": ctx.timestamp,
+        "backbone_name": cfg.backbone_model_name,
+        "transform_type": cfg.transform_type,
+        "projection_dim": cfg.projection_dim,
+        "feature_size_factor": cfg.feature_size_factor,
+        "num_prototypes": cfg.num_prototypes,
+        "distance_type": cfg.distance_type,
+        "device_type": str(device),
+        "num_train_images": len(train_ds),
+        "num_test_images": len(test_ds),
+        "image_auroc": float(metrics["image_auroc"]),
+        "pixel_auroc": float(metrics["pixel_auroc"]),
+        "aupro_mean": aupro_mean,
+        "image_f1": float(np.mean(image_f1_values)) if image_f1_values else float("nan"),
+        "pixel_f1": float(np.mean(pixel_f1_values)) if pixel_f1_values else float("nan"),
+        "mean_infer_time_sec": float(metrics["mean_infer_time_sec"]),
+        "total_runtime_sec": float(total_time),
+        "effective_num_prototypes": int(metrics.get("effective_num_prototypes", 0)),
+        "image_score_good_mean": float(np.mean([r["image_score"] for r in per_sample_eval if r["label"] == 0])) if any(r["label"] == 0 for r in per_sample_eval) else float("nan"),
+        "image_score_good_std": float(np.std([r["image_score"] for r in per_sample_eval if r["label"] == 0])) if any(r["label"] == 0 for r in per_sample_eval) else float("nan"),
+        "image_score_defect_mean": float(np.mean([r["image_score"] for r in per_sample_eval if r["label"] == 1])) if any(r["label"] == 1 for r in per_sample_eval) else float("nan"),
+        "image_score_defect_std": float(np.std([r["image_score"] for r in per_sample_eval if r["label"] == 1])) if any(r["label"] == 1 for r in per_sample_eval) else float("nan"),
+        "patch_score_good_mean": float(np.mean(np.concatenate([r["anom_map"].ravel() for r in per_sample_eval if r["label"] == 0]))) if any(r["label"] == 0 for r in per_sample_eval) else float("nan"),
+        "patch_score_good_std": float(np.std(np.concatenate([r["anom_map"].ravel() for r in per_sample_eval if r["label"] == 0]))) if any(r["label"] == 0 for r in per_sample_eval) else float("nan"),
+        "patch_score_defect_mean": float(np.mean(np.concatenate([r["anom_map"].ravel() for r in per_sample_eval if r["label"] == 1]))) if any(r["label"] == 1 for r in per_sample_eval) else float("nan"),
+        "patch_score_defect_std": float(np.std(np.concatenate([r["anom_map"].ravel() for r in per_sample_eval if r["label"] == 1]))) if any(r["label"] == 1 for r in per_sample_eval) else float("nan"),
+    }
+
+    lean_logger.log_summary_metrics(summary, summary)
+    lean_logger.log_timing_summary(timing_summary)
+    lean_logger.log_per_defect_metrics(per_defect_metrics)
+
+    if cfg.enable_diagnostics:
+        if cfg.debug_mode:
+            debug_reporter.log_per_sample_table(per_sample_rows)
+        if proto_model.inc_model is not None:
+            pmeta = proto_model.inc_model.prototypes.meta
+            status_counts = {"stable": 0, "candidate": 0, "fading": 0}
+            for m in pmeta:
+                status_counts[m.status] = status_counts.get(m.status, 0) + 1
+            counts = proto_model.inc_model.prototypes.counts
+            prototype_summary = {
+                "prototype_count_total": len(pmeta),
+                "prototype_count_stable": status_counts.get("stable", 0),
+                "prototype_count_candidate": status_counts.get("candidate", 0),
+                "dead_prototypes_count": status_counts.get("fading", 0),
+                "mean_distance_to_nearest_prototype": float(np.mean(image_scores)) if image_scores.size else float("nan"),
+                "mean_distance_to_second_nearest_prototype": float("nan"),
+                "prototype_usage_entropy": float("nan"),
+                "mean_cluster_size": float(np.mean(counts)) if counts is not None and counts.size else 0.0,
+                "std_cluster_size": float(np.std(counts)) if counts is not None and counts.size else 0.0,
+                "min_cluster_size": float(np.min(counts)) if counts is not None and counts.size else 0.0,
+                "max_cluster_size": float(np.max(counts)) if counts is not None and counts.size else 0.0,
+                "prototype_usage_count_mean": float(np.mean(counts)) if counts is not None and counts.size else 0.0,
+                "prototype_usage_count_std": float(np.std(counts)) if counts is not None and counts.size else 0.0,
+            }
+            debug_reporter.log_prototype_summary(prototype_summary)
+
+            w = proto_model.inc_model.transformer.whitening
+            replay_feats = proto_model.inc_model.replay.sample_for_update()
+            z = proto_model.inc_model.transformer.transform(replay_feats) if replay_feats.size else np.empty((0, cfg.projection_dim), dtype=np.float32)
+            last_cons = proto_model.inc_model.config.get("last_consolidation_stats", {}) if isinstance(proto_model.inc_model.config, dict) else {}
+            transform_summary = {
+                "feature_dim_before_transform": int(w.mean.shape[0]) if w.mean is not None else 0,
+                "feature_dim_after_transform": int(cfg.projection_dim),
+                "projected_feature_mean": float(np.mean(z)) if z.size else 0.0,
+                "projected_feature_std": float(np.std(z)) if z.size else 0.0,
+                "running_mean_norm": float(np.linalg.norm(w.mean)) if w.mean is not None else 0.0,
+                "running_var_mean": float(np.mean(w.var)) if w.mean is not None else 0.0,
+                "running_var_std": float(np.std(w.var)) if w.mean is not None else 0.0,
+                "running_mean_shift_since_last_update": last_cons.get("whitening_mean_shift"),
+                "running_var_shift_since_last_update": last_cons.get("whitening_var_shift"),
+            }
+            debug_reporter.log_transform_summary(transform_summary)
+
+            replay_comp = proto_model.inc_model.replay.composition()
+            best_prev_img = float(metrics["image_auroc"])
+            best_prev_pix = float(metrics["pixel_auroc"])
+            incremental_row = {
+                "update_step": proto_model.inc_model.num_seen_images,
+                "accepted_images": proto_model.inc_model.accepted_images,
+                "rejected_images": proto_model.inc_model.rejected_images,
+                "replay_size": int(sum(replay_comp.values())),
+                "num_candidates": status_counts.get("candidate", 0),
+                "num_promoted": 0,
+                "num_removed_prototypes": 0,
+                "num_fading_prototypes": status_counts.get("fading", 0),
+            }
+            debug_reporter.log_incremental_update([incremental_row])
+            debug_reporter.log_forgetting_report([{
+                "update_step": proto_model.inc_model.num_seen_images,
+                "current_image_auroc": float(metrics["image_auroc"]),
+                "best_previous_image_auroc": best_prev_img,
+                "forgetting_delta_image": float(max(best_prev_img - float(metrics["image_auroc"]), 0.0)),
+                "current_pixel_auroc": float(metrics["pixel_auroc"]),
+                "best_previous_pixel_auroc": best_prev_pix,
+                "forgetting_delta_pixel": float(max(best_prev_pix - float(metrics["pixel_auroc"]), 0.0)),
+            }])
+
+        if cfg.debug_mode:
+            debug_reporter.create_debug_plots(per_defect_metrics, image_scores, pixel_scores, timing_summary)
+
+    experiment_writer.append_row(
+        {
+            "run_id": ctx.run_id,
+            "timestamp": ctx.timestamp,
+            "backbone_name": cfg.backbone_model_name,
+            "transform_type": cfg.transform_type,
+            "projection_dim": cfg.projection_dim,
+            "feature_size_factor": cfg.feature_size_factor,
+            "num_prototypes": cfg.num_prototypes,
+            "distance_type": cfg.distance_type,
+            "image_auroc": float(metrics["image_auroc"]),
+            "pixel_auroc": float(metrics["pixel_auroc"]),
+            "aupro_mean": aupro_mean,
+            "mean_infer_time_sec": float(metrics["mean_infer_time_sec"]),
+            "total_runtime_sec": float(total_time),
+            "device_type": str(device),
+        }
     )
+
+    if cfg.enable_diagnostics and cfg.num_visualization_examples > 0:
+        gallery_path = ctx.visualizations_dir / "final_top5_overlay_gallery.png"
+        save_overlay_gallery(
+            per_sample_rows,
+            test_ds,
+            extractor,
+            proto_model,
+            gallery_path,
+            num_examples=cfg.num_visualization_examples,
+        )
 
     print("Final metrics:")
     print(json.dumps(metrics, indent=2))
-    print(f"Per-sample report: {output_dir / 'per_sample_report.csv'}")
-    print(f"Per-defect metrics: {output_dir / 'per_defect_metrics.csv'}")
-    if cfg.num_visualization_examples > 0:
-        print(f"Overlay gallery (false-color): {gallery_path}")
-    else:
-        print("Overlay gallery skipped (--num-visualization-examples <= 0).")
+    print(f"Run outputs: {ctx.root_dir}")
     return metrics
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MVTec AD metal_nut PoC (pretrained timm backbones)")
     parser.add_argument("--feature-size-factor", type=float, default=0.75)
-    parser.add_argument("--num-prototypes", type=int, default=256)
-    parser.add_argument("--pca-dim", type=int, default=128)
-    parser.add_argument("--distance-type", type=str, default="cosine", choices=["cosine", "l2", "mahalanobis_diag"])
+    parser.add_argument("--num-prototypes", type=int, default=512)
+    parser.add_argument("--distance-type", type=str, default="l2", choices=["cosine", "l2", "mahalanobis_diag"])
+    parser.add_argument("--projection-type", type=str, default="sparse_random_projection", choices=["sparse_random_projection", "gaussian_random_projection"])
+    parser.add_argument("--projection-dim", type=int, default=96)
+    parser.add_argument("--projection-seed", type=int, default=42)
+    parser.add_argument("--whitening-eps", type=float, default=1e-6)
     parser.add_argument(
         "--backbone-model-name",
         type=str,
@@ -917,7 +1083,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mahalanobis-alpha", type=float, default=0.7)
     parser.add_argument("--mahalanobis-min-var", type=float, default=1e-6)
     parser.add_argument("--mahalanobis-eps", type=float, default=1e-12)
-    return parser.parse_args()
+    parser.add_argument("--enable-diagnostics", dest="enable_diagnostics", action="store_true", default=True)
+    parser.add_argument("--disable-diagnostics", dest="enable_diagnostics", action="store_false")
+    parser.add_argument("--debug-mode", action="store_true", default=False)
+    parser.add_argument("--save-per-sample-report", action="store_true", default=False)
+    parser.add_argument("--save-plots", action="store_true", default=False)
+    args = parser.parse_args()
+    if args.debug_mode:
+        if not args.save_per_sample_report:
+            args.save_per_sample_report = True
+        if not args.save_plots:
+            args.save_plots = True
+    return args
 
 
 def main() -> None:
@@ -926,8 +1103,15 @@ def main() -> None:
         backbone_model_name=args.backbone_model_name,
         feature_size_factor=args.feature_size_factor,
         num_prototypes=args.num_prototypes,
-        pca_dim=args.pca_dim,
         distance_type=args.distance_type,
+        projection_type=args.projection_type,
+        projection_dim=args.projection_dim,
+        projection_seed=args.projection_seed,
+        whitening_eps=args.whitening_eps,
+        enable_diagnostics=args.enable_diagnostics,
+        debug_mode=args.debug_mode,
+        save_per_sample_report=args.save_per_sample_report,
+        save_plots=args.save_plots,
         num_visualization_examples=args.num_visualization_examples,
         mahalanobis_alpha=args.mahalanobis_alpha,
         mahalanobis_min_var=args.mahalanobis_min_var,
