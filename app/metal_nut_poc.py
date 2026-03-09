@@ -316,6 +316,7 @@ class FeatureExtractor:
         maps = self._select_maps(list(maps), layer_mode)
         target_hw = maps[-1].shape[-2:]
 
+        target_hw = maps[-1].shape[-2:]
         norm_maps = []
         for fmap in maps:
             if fmap.shape[-2:] != target_hw:
@@ -1078,6 +1079,9 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
     t_train = time.perf_counter()
     proto_model.fit(train_ds, extractor)
     train_time = time.perf_counter() - t_train
+    train_backbone = float(proto_model.fit_timing.get("time_backbone_forward_train", 0.0))
+    train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
+    train_proto_t = float(proto_model.fit_timing.get("time_prototype_update_train", 0.0))
 
     train_backbone = float(proto_model.fit_timing.get("time_backbone_forward_train", 0.0))
     train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
