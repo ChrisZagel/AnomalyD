@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import random
 import shutil
@@ -104,6 +105,7 @@ class PoCConfig:
     save_per_sample_report: bool = False
     save_plots: bool = False
     num_visualization_examples: int = 5
+    disable_feature_cache: bool = False
 
 
 class MVTecMetalNutDataset:
@@ -415,17 +417,46 @@ class PrototypeAnomalyModel:
             "candidate_distance_threshold": self.cfg.candidate_distance_threshold,
         }
 
-    def fit(self, dataset: MVTecMetalNutDataset, extractor: FeatureExtractor) -> None:
-        train_feats = []
-        t_backbone = 0.0
-        for sample in tqdm(dataset.samples, desc="Collect features for incremental model"):
-            image = Image.open(sample).convert("RGB")
-            t0 = time.perf_counter()
-            feats, _, _ = extractor.extract_patch_features(image)
-            t_backbone += float(time.perf_counter() - t0)
-            train_feats.append(feats.astype(np.float32))
+    def _build_train_feature_cache_path(self, dataset: MVTecMetalNutDataset) -> Path:
+        train_basenames = [p.name for p in dataset.samples]
+        key_payload = {
+            "backbone_model_name": self.cfg.backbone_model_name,
+            "feature_size_factor": self.cfg.feature_size_factor,
+            "feature_layer_mode": self.cfg.feature_layer_mode,
+            "dataset_path": str(dataset.root.resolve()),
+            "train_image_count": len(train_basenames),
+            "train_image_basenames": train_basenames,
+        }
+        key_json = json.dumps(key_payload, sort_keys=True, ensure_ascii=False)
+        key_hash = hashlib.sha256(key_json.encode("utf-8")).hexdigest()[:16]
+        return Path(self.cfg.project_root) / "outputs" / "cache" / f"train_feats_{key_hash}.npz"
 
-        all_feats = np.concatenate(train_feats, axis=0)
+    def fit(self, dataset: MVTecMetalNutDataset, extractor: FeatureExtractor) -> None:
+        cache_path = self._build_train_feature_cache_path(dataset)
+        all_feats: np.ndarray | None = None
+        t_backbone = 0.0
+
+        if not self.cfg.disable_feature_cache and cache_path.exists():
+            cache_payload = np.load(cache_path)
+            all_feats = cache_payload["all_feats"].astype(np.float32)
+            print(f"Loaded cached train features: {cache_path}")
+
+        if all_feats is None:
+            train_feats = []
+            for sample in tqdm(dataset.samples, desc="Collect features for incremental model"):
+                image = Image.open(sample).convert("RGB")
+                t0 = time.perf_counter()
+                feats, _, _ = extractor.extract_patch_features(image)
+                t_backbone += float(time.perf_counter() - t0)
+                train_feats.append(feats.astype(np.float32))
+
+            all_feats = np.concatenate(train_feats, axis=0)
+
+            if not self.cfg.disable_feature_cache:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(cache_path, all_feats=all_feats)
+                print(f"Saved train feature cache: {cache_path}")
+
         if all_feats.shape[0] > self.cfg.max_pca_samples:
             idx = np.random.choice(all_feats.shape[0], self.cfg.max_pca_samples, replace=False)
             all_feats = all_feats[idx]
@@ -1331,6 +1362,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-mode", action="store_true", default=False)
     parser.add_argument("--save-per-sample-report", action="store_true", default=False)
     parser.add_argument("--save-plots", action="store_true", default=False)
+    parser.add_argument("--disable-feature-cache", action="store_true", default=False)
     args = parser.parse_args()
     if args.debug_mode:
         if not args.save_per_sample_report:
@@ -1371,6 +1403,7 @@ def main() -> None:
         save_per_sample_report=args.save_per_sample_report,
         save_plots=args.save_plots,
         num_visualization_examples=args.num_visualization_examples,
+        disable_feature_cache=args.disable_feature_cache,
         mahalanobis_alpha=args.mahalanobis_alpha,
         mahalanobis_min_var=args.mahalanobis_min_var,
         mahalanobis_eps=args.mahalanobis_eps,
