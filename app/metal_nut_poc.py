@@ -274,7 +274,7 @@ class FeatureExtractor:
                 input_names=["input"],
                 output_names=[f"feat_{i}" for i in range(3)],
                 dynamic_axes=None,
-                opset_version=17,
+                opset_version=18,
             )
 
         core = ov.Core()
@@ -309,8 +309,11 @@ class FeatureExtractor:
                 self._ensure_openvino(tuple(tensor.shape))
                 assert self._ov_compiled is not None and self._ov_input_name is not None
                 outputs = self._ov_compiled({self._ov_input_name: tensor.detach().cpu().numpy()})
-                maps = [torch.from_numpy(outputs[o]).to(self.device) for o in outputs]
-                maps = sorted(maps, key=lambda m: m.shape[-1])
+                if isinstance(outputs, dict):
+                    ordered_keys = sorted(outputs.keys(), key=lambda k: str(k))
+                    maps = [torch.from_numpy(outputs[k]).to(self.device) for k in ordered_keys]
+                else:
+                    maps = [torch.from_numpy(o).to(self.device) for o in outputs]
             except Exception as exc:
                 warnings.warn(
                     f"OpenVINO backend unavailable ({exc}). Falling back to pytorch backend for this run.",
@@ -1086,8 +1089,16 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
 
     proto_model = PrototypeAnomalyModel(cfg)
     t_train = time.perf_counter()
+    original_backend = extractor.inference_backend
+    if original_backend == "openvino":
+        extractor.inference_backend = "pytorch"
     proto_model.fit(train_ds, extractor)
+    extractor.inference_backend = original_backend
     train_time = time.perf_counter() - t_train
+    train_backbone = float(proto_model.fit_timing.get("time_backbone_forward_train", 0.0))
+    train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
+    train_proto_t = float(proto_model.fit_timing.get("time_prototype_update_train", 0.0))
+
     train_backbone = float(proto_model.fit_timing.get("time_backbone_forward_train", 0.0))
     train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
     train_proto_t = float(proto_model.fit_timing.get("time_prototype_update_train", 0.0))
