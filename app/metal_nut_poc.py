@@ -231,6 +231,8 @@ class FeatureExtractor:
         )
         self._ov_compiled = None
         self._ov_input_name: str | None = None
+        self._ov_output_ports: list[Any] = []
+        self.openvino_active_in_eval: bool = False
 
     def _select_maps(self, maps: list[torch.Tensor], layer_mode: str) -> list[torch.Tensor]:
         if layer_mode == "single_last_layer":
@@ -281,6 +283,42 @@ class FeatureExtractor:
         model = core.read_model(str(onnx_path))
         self._ov_compiled = core.compile_model(model, "CPU")
         self._ov_input_name = model.inputs[0].get_any_name()
+        self._ov_output_ports = list(self._ov_compiled.outputs)
+
+    @staticmethod
+    def _ov_tensor_to_numpy(tensor: Any) -> np.ndarray:
+        if isinstance(tensor, np.ndarray):
+            return tensor
+
+        data = getattr(tensor, "data", None)
+        if data is not None:
+            try:
+                return np.array(data)
+            except Exception:
+                try:
+                    return np.array(data[:])
+                except Exception:
+                    pass
+
+        return np.array(tensor)
+
+    def _collect_openvino_outputs(self, outputs: Any) -> list[np.ndarray]:
+        ordered_tensors: list[Any] = []
+
+        if isinstance(outputs, dict):
+            if self._ov_output_ports:
+                missing_ports = [port for port in self._ov_output_ports if port not in outputs]
+                if missing_ports:
+                    raise RuntimeError("OpenVINO output dict is missing expected output ports.")
+                ordered_tensors = [outputs[port] for port in self._ov_output_ports]
+            else:
+                raise RuntimeError("OpenVINO output order is not initialized.")
+        elif isinstance(outputs, (list, tuple)):
+            ordered_tensors = list(outputs)
+        else:
+            raise RuntimeError(f"Unsupported OpenVINO output type: {type(outputs).__name__}")
+
+        return [self._ov_tensor_to_numpy(tensor) for tensor in ordered_tensors]
 
     @torch.no_grad()
     def extract_patch_features(
@@ -309,11 +347,9 @@ class FeatureExtractor:
                 self._ensure_openvino(tuple(tensor.shape))
                 assert self._ov_compiled is not None and self._ov_input_name is not None
                 outputs = self._ov_compiled({self._ov_input_name: tensor.detach().cpu().numpy()})
-                if isinstance(outputs, dict):
-                    ordered_keys = sorted(outputs.keys(), key=lambda k: str(k))
-                    maps = [torch.from_numpy(outputs[k]).to(self.device) for k in ordered_keys]
-                else:
-                    maps = [torch.from_numpy(o).to(self.device) for o in outputs]
+                ov_maps = self._collect_openvino_outputs(outputs)
+                maps = [torch.from_numpy(ov_map).to(self.device) for ov_map in ov_maps]
+                self.openvino_active_in_eval = True
             except Exception as exc:
                 warnings.warn(
                     f"OpenVINO backend unavailable ({exc}). Falling back to pytorch backend for this run.",
@@ -745,6 +781,7 @@ def evaluate(
     num_visualization_examples: int,
     debug_mode: bool,
 ) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]], np.ndarray, np.ndarray, dict[str, float]]:
+    extractor.openvino_active_in_eval = False
     image_labels: list[int] = []
     image_scores: list[float] = []
     pixel_labels: list[np.ndarray] = []
@@ -1215,6 +1252,7 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
         "mean_infer_time_sec": float(metrics["mean_infer_time_sec"]),
         "num_eval_passes_executed": int(num_eval_passes_executed),
         "inference_backend": cfg.inference_backend,
+        "openvino_active_in_eval": bool(extractor.openvino_active_in_eval),
     }
 
     summary = {
