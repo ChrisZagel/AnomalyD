@@ -104,6 +104,7 @@ class PoCConfig:
     save_per_sample_report: bool = False
     save_plots: bool = False
     num_visualization_examples: int = 5
+    eval_batch_size: int = 4
 
 
 class MVTecMetalNutDataset:
@@ -347,6 +348,109 @@ class FeatureExtractor:
             return patch_feats.cpu().numpy(), (h, w), (work_h, work_w), timing
         return patch_feats.cpu().numpy(), (h, w), (work_h, work_w)
 
+    @torch.no_grad()
+    def extract_patch_features_batch(
+        self,
+        images: list[Image.Image],
+        *,
+        feature_size_factor: float | None = None,
+        feature_layer_mode: str | None = None,
+        return_timing: bool = False,
+    ) -> list[tuple[np.ndarray, tuple[int, int], tuple[int, int]]] | list[tuple[np.ndarray, tuple[int, int], tuple[int, int], dict[str, float]]]:
+        if not images:
+            return []
+
+        fsf = self.cfg.feature_size_factor if feature_size_factor is None else feature_size_factor
+        layer_mode = self.cfg.feature_layer_mode if feature_layer_mode is None else feature_layer_mode
+
+        tensors: list[torch.Tensor] = []
+        work_sizes: list[tuple[int, int]] = []
+        for image in images:
+            tensor = self.transform(image)
+            orig_h, orig_w = tensor.shape[-2:]
+            if fsf != 1.0:
+                work_h = max(14, int(round(orig_h * fsf / 14) * 14))
+                work_w = max(14, int(round(orig_w * fsf / 14) * 14))
+                tensor = F.interpolate(
+                    tensor.unsqueeze(0),
+                    size=(work_h, work_w),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+            else:
+                work_h, work_w = orig_h, orig_w
+            tensors.append(tensor)
+            work_sizes.append((work_h, work_w))
+
+        if len(set(work_sizes)) != 1:
+            out: list[Any] = []
+            for image in images:
+                out.append(
+                    self.extract_patch_features(
+                        image,
+                        feature_size_factor=feature_size_factor,
+                        feature_layer_mode=feature_layer_mode,
+                        return_timing=return_timing,
+                    )
+                )
+            return out
+
+        batch = torch.stack(tensors, dim=0).to(self.device)
+
+        t0 = time.perf_counter()
+        if self.inference_backend == "openvino":
+            try:
+                self._ensure_openvino(tuple(batch.shape))
+                assert self._ov_compiled is not None and self._ov_input_name is not None
+                outputs = self._ov_compiled({self._ov_input_name: batch.detach().cpu().numpy()})
+                if isinstance(outputs, dict):
+                    ordered_keys = sorted(outputs.keys(), key=lambda k: str(k))
+                    maps = [torch.from_numpy(outputs[k]).to(self.device) for k in ordered_keys]
+                else:
+                    maps = [torch.from_numpy(o).to(self.device) for o in outputs]
+            except Exception as exc:
+                warnings.warn(
+                    f"OpenVINO backend unavailable ({exc}). Falling back to pytorch backend for this run.",
+                    RuntimeWarning,
+                )
+                self.inference_backend = "pytorch"
+                maps = self.backbone(batch)
+        else:
+            maps = self.backbone(batch)
+        t1 = time.perf_counter()
+
+        maps = self._select_maps(list(maps), layer_mode)
+        target_hw = maps[-1].shape[-2:]
+        norm_maps = []
+        for fmap in maps:
+            if fmap.shape[-2:] != target_hw:
+                fmap = F.interpolate(fmap, size=target_hw, mode="bilinear", align_corners=False)
+            fmap = F.normalize(fmap, p=2, dim=1)
+            norm_maps.append(fmap)
+
+        fused = torch.cat(norm_maps, dim=1)
+        b, c, h, w = fused.shape
+        patch_feats = fused.permute(0, 2, 3, 1).reshape(b, h * w, c).cpu().numpy()
+        t2 = time.perf_counter()
+
+        out: list[Any] = []
+        for i in range(b):
+            if return_timing:
+                out.append(
+                    (
+                        patch_feats[i],
+                        (h, w),
+                        work_sizes[i],
+                        {
+                            "time_backbone_forward_eval": float(t1 - t0) / b,
+                            "time_feature_fusion_eval": float(t2 - t1) / b,
+                        },
+                    )
+                )
+            else:
+                out.append((patch_feats[i], (h, w), work_sizes[i]))
+        return out
+
 
 class PrototypeAnomalyModel:
     def __init__(self, cfg: PoCConfig) -> None:
@@ -500,17 +604,21 @@ class PrototypeAnomalyModel:
         image: Image.Image,
         extractor: FeatureExtractor,
         orig_size: tuple[int, int],
+        precomputed_stage_a: tuple[np.ndarray, tuple[int, int], tuple[int, int], dict[str, float]] | None = None,
     ) -> tuple[np.ndarray, float, dict[str, Any]]:
         if self.inc_model is None:
             raise RuntimeError("Model is not fitted yet.")
 
         t0 = time.perf_counter()
-        feats, grid_hw, work_hw, ext_timing = extractor.extract_patch_features(
-            image,
-            feature_size_factor=self.cfg.feature_size_factor,
-            feature_layer_mode=self.cfg.feature_layer_mode,
-            return_timing=True,
-        )
+        if precomputed_stage_a is None:
+            feats, grid_hw, work_hw, ext_timing = extractor.extract_patch_features(
+                image,
+                feature_size_factor=self.cfg.feature_size_factor,
+                feature_layer_mode=self.cfg.feature_layer_mode,
+                return_timing=True,
+            )
+        else:
+            feats, grid_hw, work_hw, ext_timing = precomputed_stage_a
         t1 = time.perf_counter()
         patch_scores = self.inc_model.predict(feats.astype(np.float32))
         t2 = time.perf_counter()
@@ -769,61 +877,76 @@ def evaluate(
     triggered = 0
     refine_rois_total = 0
 
-    for idx in tqdm(range(len(test_ds)), desc="Evaluate test set"):
-        sample = test_ds[idx]
-        t0 = time.perf_counter()
-        anom_map, image_score, meta = proto_model.infer_map(sample["image"], extractor, sample["orig_size"])
-        infer_sec = time.perf_counter() - t0
+    eval_batch_size = max(1, int(proto_model.cfg.eval_batch_size))
+    for batch_start in tqdm(range(0, len(test_ds), eval_batch_size), desc="Evaluate test set"):
+        batch_end = min(len(test_ds), batch_start + eval_batch_size)
+        samples = [test_ds[idx] for idx in range(batch_start, batch_end)]
+        batch_stage_a = extractor.extract_patch_features_batch(
+            [sample["image"] for sample in samples],
+            feature_size_factor=proto_model.cfg.feature_size_factor,
+            feature_layer_mode=proto_model.cfg.feature_layer_mode,
+            return_timing=True,
+        )
 
-        t_backbone += float(meta.get("time_backbone_forward_eval", 0.0))
-        t_transform += float(meta.get("time_transform_eval", 0.0))
-        t_distance += float(meta.get("time_distance_eval", 0.0))
-        t_post += float(meta.get("time_postprocess_eval", 0.0))
-        t_fusion += float(meta.get("time_feature_fusion_eval", 0.0))
-        t_total += float(meta.get("time_total_infer", infer_sec))
-        t_stage_a_backbone += float(meta.get("stage_a_backbone_time", 0.0))
-        t_stage_b_backbone += float(meta.get("stage_b_backbone_time", 0.0))
-        t_roi += float(meta.get("roi_proposal_time", 0.0))
-        t_merge += float(meta.get("merge_time", 0.0))
-        triggered += int(meta.get("stage_a_triggered", 0))
-        refine_rois_total += int(meta.get("num_refine_rois", 0))
+        for idx, sample, precomputed in zip(range(batch_start, batch_end), samples, batch_stage_a):
+            t0 = time.perf_counter()
+            anom_map, image_score, meta = proto_model.infer_map(
+                sample["image"],
+                extractor,
+                sample["orig_size"],
+                precomputed_stage_a=precomputed,
+            )
+            infer_sec = time.perf_counter() - t0
 
-        image_labels.append(sample["label"])
-        image_scores.append(image_score)
-        pixel_labels.append(sample["mask"].astype(np.uint8).ravel())
-        pixel_scores.append(anom_map.ravel())
+            t_backbone += float(meta.get("time_backbone_forward_eval", 0.0))
+            t_transform += float(meta.get("time_transform_eval", 0.0))
+            t_distance += float(meta.get("time_distance_eval", 0.0))
+            t_post += float(meta.get("time_postprocess_eval", 0.0))
+            t_fusion += float(meta.get("time_feature_fusion_eval", 0.0))
+            t_total += float(meta.get("time_total_infer", infer_sec))
+            t_stage_a_backbone += float(meta.get("stage_a_backbone_time", 0.0))
+            t_stage_b_backbone += float(meta.get("stage_b_backbone_time", 0.0))
+            t_roi += float(meta.get("roi_proposal_time", 0.0))
+            t_merge += float(meta.get("merge_time", 0.0))
+            triggered += int(meta.get("stage_a_triggered", 0))
+            refine_rois_total += int(meta.get("num_refine_rois", 0))
 
-        row = {
-            "index": idx,
-            "path": sample["path"],
-            "defect_type": sample["defect_type"],
-            "label": sample["label"],
-            "image_score": float(image_score),
-            "infer_time_sec": float(infer_sec),
-            "map_mean": float(anom_map.mean()),
-            "map_max": float(anom_map.max()),
-            "stage_a_triggered": int(meta.get("stage_a_triggered", 0)),
-            "num_refine_rois": int(meta.get("num_refine_rois", 0)),
-            "stage_a_image_score": float(meta.get("stage_a_image_score", image_score)),
-            "stage_b_refined_max_score": float(meta.get("stage_b_refined_max_score", np.max(anom_map))),
-            "final_image_score": float(meta.get("final_image_score", image_score)),
-        }
-        per_sample_rows.append(row)
+            image_labels.append(sample["label"])
+            image_scores.append(image_score)
+            pixel_labels.append(sample["mask"].astype(np.uint8).ravel())
+            pixel_scores.append(anom_map.ravel())
 
-        per_sample_eval.append(
-            {
+            row = {
                 "index": idx,
+                "path": sample["path"],
                 "defect_type": sample["defect_type"],
                 "label": sample["label"],
                 "image_score": float(image_score),
-                "mask": sample["mask"].astype(np.uint8),
-                "anom_map": anom_map.astype(np.float32),
+                "infer_time_sec": float(infer_sec),
+                "map_mean": float(anom_map.mean()),
+                "map_max": float(anom_map.max()),
+                "stage_a_triggered": int(meta.get("stage_a_triggered", 0)),
+                "num_refine_rois": int(meta.get("num_refine_rois", 0)),
+                "stage_a_image_score": float(meta.get("stage_a_image_score", image_score)),
+                "stage_b_refined_max_score": float(meta.get("stage_b_refined_max_score", np.max(anom_map))),
+                "final_image_score": float(meta.get("final_image_score", image_score)),
             }
-        )
+            per_sample_rows.append(row)
 
-        if save_visualizations and saved_vis < num_visualization_examples:
-            save_visualization(sample, anom_map, vis_dir / f"sample_{idx:03d}.png")
-            saved_vis += 1
+            per_sample_eval.append(
+                {
+                    "index": idx,
+                    "defect_type": sample["defect_type"],
+                    "label": sample["label"],
+                    "image_score": float(image_score),
+                    "mask": sample["mask"].astype(np.uint8),
+                    "anom_map": anom_map.astype(np.float32),
+                }
+            )
+
+            if save_visualizations and saved_vis < num_visualization_examples:
+                save_visualization(sample, anom_map, vis_dir / f"sample_{idx:03d}.png")
+                saved_vis += 1
 
     image_auc = float(roc_auc_score(image_labels, image_scores))
     pixel_auc = float(roc_auc_score(np.concatenate(pixel_labels), np.concatenate(pixel_scores)))
@@ -1331,6 +1454,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-mode", action="store_true", default=False)
     parser.add_argument("--save-per-sample-report", action="store_true", default=False)
     parser.add_argument("--save-plots", action="store_true", default=False)
+    parser.add_argument("--eval-batch-size", type=int, default=4)
     args = parser.parse_args()
     if args.debug_mode:
         if not args.save_per_sample_report:
@@ -1371,6 +1495,7 @@ def main() -> None:
         save_per_sample_report=args.save_per_sample_report,
         save_plots=args.save_plots,
         num_visualization_examples=args.num_visualization_examples,
+        eval_batch_size=args.eval_batch_size,
         mahalanobis_alpha=args.mahalanobis_alpha,
         mahalanobis_min_var=args.mahalanobis_min_var,
         mahalanobis_eps=args.mahalanobis_eps,
