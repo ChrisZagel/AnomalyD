@@ -909,7 +909,7 @@ def save_overlay_gallery(
 
     for ax, row in zip(axes, top_rows):
         sample = test_ds[int(row["index"])]
-        anom_map, _ = proto_model.infer_map(sample["image"], extractor, sample["orig_size"])
+        anom_map, _, _ = proto_model.infer_map(sample["image"], extractor, sample["orig_size"])
         image_np = np.array(sample["image"]) / 255.0
         norm = (anom_map - anom_map.min()) / (anom_map.max() - anom_map.min() + 1e-8)
         heat = plt.cm.jet(norm)[..., :3]

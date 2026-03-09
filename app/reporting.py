@@ -164,8 +164,10 @@ class DebugReporter:
         vals = [timing[k] for k in keys]
         if keys:
             fig, ax = plt.subplots(figsize=(8, 4))
-            ax.bar(keys, vals)
+            x = np.arange(len(keys))
+            ax.bar(x, vals)
             ax.set_ylabel("seconds")
+            ax.set_xticks(x)
             ax.set_xticklabels(keys, rotation=30, ha="right")
             fig.tight_layout()
             fig.savefig(self.ctx.plots_dir / "timing_breakdown.png", dpi=130)
