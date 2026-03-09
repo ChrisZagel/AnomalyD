@@ -83,3 +83,12 @@ Use `experiment_results.csv` to compare runs by backbone, transform config, AURO
 - add new replay policies in `ReplayMemoryManager`
 - keep hot path lean; add expensive diagnostics only behind `debug_mode`
 - document architecture changes in `ARCHITECTURE.md`
+
+
+## Diagnostics switches
+
+- `--enable-diagnostics` (default): writes lean baseline metrics/tables.
+- `--disable-diagnostics`: disables diagnostics files and keeps only console/final minimal output.
+- `--debug-mode`: adds extended diagnostics (per-sample report and selected plots) on top of baseline diagnostics.
+
+Normal diagnostics stay lightweight; debug mode is intended for deeper analysis.

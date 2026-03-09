@@ -109,8 +109,9 @@ class LeanMetricsLogger:
 
 
 class DebugReporter:
-    def __init__(self, ctx: RunContext, debug_mode: bool, save_per_sample_report: bool, save_plots: bool) -> None:
+    def __init__(self, ctx: RunContext, enable_diagnostics: bool, debug_mode: bool, save_per_sample_report: bool, save_plots: bool) -> None:
         self.ctx = ctx
+        self.enable_diagnostics = enable_diagnostics
         self.debug_mode = debug_mode
         self.save_per_sample_report = save_per_sample_report
         self.save_plots = save_plots
@@ -125,19 +126,19 @@ class DebugReporter:
             writer.writerows(rows)
 
     def log_prototype_summary(self, summary: dict[str, Any]) -> None:
-        if not self.debug_mode:
+        if not self.enable_diagnostics:
             return
         with open(self.ctx.metrics_dir / "prototype_summary.json", "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
 
     def log_transform_summary(self, summary: dict[str, Any]) -> None:
-        if not self.debug_mode:
+        if not self.enable_diagnostics:
             return
         with open(self.ctx.metrics_dir / "transform_summary.json", "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
 
     def log_incremental_update(self, rows: list[dict[str, Any]]) -> None:
-        if not (self.debug_mode and rows):
+        if not (self.enable_diagnostics and rows):
             return
         out_path = self.ctx.tables_dir / "incremental_update_log.csv"
         with open(out_path, "w", encoding="utf-8", newline="") as f:
@@ -146,7 +147,7 @@ class DebugReporter:
             writer.writerows(rows)
 
     def log_forgetting_report(self, rows: list[dict[str, Any]]) -> None:
-        if not (self.debug_mode and rows):
+        if not (self.enable_diagnostics and rows):
             return
         out_path = self.ctx.tables_dir / "forgetting_report.csv"
         with open(out_path, "w", encoding="utf-8", newline="") as f:

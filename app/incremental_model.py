@@ -377,14 +377,27 @@ class IncrementalADModel:
         self.rejected_images = 0
         self.threshold = float(config.get("update_accept_threshold", 3.0))
         self._checkpoint: dict[str, Any] | None = None
+        self.last_fit_timing: dict[str, float] = {}
+        self.last_consolidation_stats: dict[str, float] = {}
 
     def fit_initial(self, x: np.ndarray) -> None:
+        import time
+
+        t0 = time.perf_counter()
         self.transformer.fit_initial(x)
+        t1 = time.perf_counter()
         z = self.transformer.transform(x)
+        t2 = time.perf_counter()
         self.prototypes.fit_initial(z, seed=self.config.get("projection_seed", 42))
+        t3 = time.perf_counter()
         d, _ = self.prototypes.nearest(z)
         self.replay.add(x, d)
         self.threshold = float(np.quantile(d, self.config.get("update_accept_quantile", 0.99)))
+        t4 = time.perf_counter()
+        self.last_fit_timing = {
+            "time_transform_update_train": float((t1 - t0) + (t2 - t1)),
+            "time_prototype_update_train": float((t3 - t2) + (t4 - t3)),
+        }
 
     def predict(self, x: np.ndarray) -> np.ndarray:
         z = self.transformer.transform(x)
@@ -443,7 +456,7 @@ class IncrementalADModel:
         new_var = self.transformer.whitening.var
         mean_shift = float(np.linalg.norm(new_mean - old_mean)) if old_mean is not None else 0.0
         var_shift = float(np.linalg.norm(new_var - old_var)) if old_var is not None else 0.0
-        return {
+        result = {
             "status": "ok",
             "model_version": self.model_version,
             "whitening_mean_shift": mean_shift,
@@ -452,6 +465,10 @@ class IncrementalADModel:
             "threshold": self.threshold,
             **stats,
         }
+        self.last_consolidation_stats = {"whitening_mean_shift": mean_shift, "whitening_var_shift": var_shift}
+        if isinstance(self.config, dict):
+            self.config["last_consolidation_stats"] = dict(self.last_consolidation_stats)
+        return result
 
     def rollback(self) -> None:
         if self._checkpoint is not None:
@@ -468,6 +485,8 @@ class IncrementalADModel:
             "accepted_images": self.accepted_images,
             "rejected_images": self.rejected_images,
             "threshold": self.threshold,
+            "last_fit_timing": self.last_fit_timing,
+            "last_consolidation_stats": self.last_consolidation_stats,
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -480,6 +499,8 @@ class IncrementalADModel:
         self.accepted_images = int(state["accepted_images"])
         self.rejected_images = int(state["rejected_images"])
         self.threshold = float(state["threshold"])
+        self.last_fit_timing = state.get("last_fit_timing", {})
+        self.last_consolidation_stats = state.get("last_consolidation_stats", {})
 
     def save_state(self, path: str | Path) -> None:
         with open(path, "wb") as f:

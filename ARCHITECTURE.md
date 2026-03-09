@@ -88,3 +88,10 @@ Main classes:
 - prototypes: `num_prototypes`, `distance_type`
 - replay/update: `max_replay_features`, `candidate_promotion_hits`, `update_trigger_images`, `threshold_beta`
 - diagnostics: `enable_diagnostics`, `debug_mode`, `save_per_sample_report`, `save_plots`, `num_visualization_examples`
+
+
+## 11) Lean diagnostics behavior
+
+- With `enable_diagnostics=True`, lightweight baseline outputs are always written (`summary.json`, `timing_summary.json`, `transform_summary.json`, `prototype_summary.json`, `incremental_update_log.csv`, `forgetting_report.csv`).
+- With `debug_mode=True`, richer diagnostics (per-sample table + debug plots) are added on top.
+- Timing and score-separation metrics reuse values already computed during fit/eval to keep runtime overhead low.

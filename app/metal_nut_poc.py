@@ -245,6 +245,7 @@ class PrototypeAnomalyModel:
         self.centers: np.ndarray | None = None
         self.mahalanobis_means: np.ndarray | None = None
         self.mahalanobis_vars: np.ndarray | None = None
+        self.fit_timing: dict[str, float] = {}
 
     @staticmethod
     def _resolve_num_clusters(requested: int, n_samples: int) -> int:
@@ -306,9 +307,12 @@ class PrototypeAnomalyModel:
 
     def fit(self, dataset: MVTecMetalNutDataset, extractor: FeatureExtractor) -> None:
         train_feats = []
+        t_backbone = 0.0
         for sample in tqdm(dataset.samples, desc="Collect features for incremental model"):
             image = Image.open(sample).convert("RGB")
+            t0 = time.perf_counter()
             feats, _, _ = extractor.extract_patch_features(image)
+            t_backbone += float(time.perf_counter() - t0)
             train_feats.append(feats.astype(np.float32))
 
         all_feats = np.concatenate(train_feats, axis=0)
@@ -319,6 +323,7 @@ class PrototypeAnomalyModel:
         self.inc_model = IncrementalADModel(self._build_inc_config())
         self.inc_model.fit_initial(all_feats)
         self.centers = self.inc_model.prototypes.means
+        self.fit_timing = {"time_backbone_forward_train": t_backbone, **self.inc_model.last_fit_timing}
 
     def save(self, output_dir: Path) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -497,7 +502,7 @@ def evaluate(
     save_visualizations: bool,
     num_visualization_examples: int,
     debug_mode: bool,
-) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]], np.ndarray, np.ndarray]:
+) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]], np.ndarray, np.ndarray, dict[str, float]]:
     image_labels: list[int] = []
     image_scores: list[float] = []
     pixel_labels: list[np.ndarray] = []
@@ -509,11 +514,31 @@ def evaluate(
         vis_dir.mkdir(parents=True, exist_ok=True)
 
     saved_vis = 0
+    t_backbone = 0.0
+    t_transform = 0.0
+    t_distance = 0.0
+    t_post = 0.0
     for idx in tqdm(range(len(test_ds)), desc="Evaluate test set"):
         sample = test_ds[idx]
         t0 = time.perf_counter()
-        anom_map, image_score = proto_model.infer_map(sample["image"], extractor, sample["orig_size"])
-        infer_sec = time.perf_counter() - t0
+        feats, grid_hw, work_hw = extractor.extract_patch_features(sample["image"])
+        t1 = time.perf_counter()
+        patch_scores = proto_model.inc_model.predict(feats.astype(np.float32)) if proto_model.inc_model is not None else np.zeros((grid_hw[0] * grid_hw[1],), dtype=np.float32)
+        t2 = time.perf_counter()
+        token_map = patch_scores.reshape(grid_hw)
+        token_map_t = torch.from_numpy(token_map).unsqueeze(0).unsqueeze(0).float()
+        work_map = F.interpolate(token_map_t, size=work_hw, mode="bilinear", align_corners=False)
+        anom_map = F.interpolate(work_map, size=sample["orig_size"], mode="bilinear", align_corners=False)[0, 0].numpy()
+        if proto_model.cfg.use_gaussian_smoothing:
+            anom_map = gaussian_filter(anom_map, sigma=proto_model.cfg.gaussian_sigma)
+        topk = max(1, int(anom_map.size * proto_model.cfg.topk_percent / 100.0))
+        image_score = float(np.mean(np.partition(anom_map.ravel(), -topk)[-topk:]))
+        t3 = time.perf_counter()
+        infer_sec = t3 - t0
+        t_backbone += float(t1 - t0)
+        t_transform += 0.0
+        t_distance += float(t2 - t1)
+        t_post += float(t3 - t2)
 
         image_labels.append(sample["label"])
         image_scores.append(image_score)
@@ -583,7 +608,8 @@ def evaluate(
         "mean_infer_time_sec": float(np.mean([r.get("infer_time_sec", r.get("time_total_infer", 0.0)) for r in per_sample_rows])),
         "std_infer_time_sec": float(np.std([r.get("infer_time_sec", r.get("time_total_infer", 0.0)) for r in per_sample_rows])),
     }
-    return metrics, per_sample_rows, per_sample_eval, np.array(image_scores, dtype=np.float32), np.concatenate(pixel_scores)
+    timing = {"time_backbone_forward_eval": t_backbone, "time_transform_eval": t_transform, "time_distance_eval": t_distance, "time_postprocess_eval": t_post}
+    return metrics, per_sample_rows, per_sample_eval, np.array(image_scores, dtype=np.float32), np.concatenate(pixel_scores), timing
 
 
 def compute_defect_level_aurocs(rows: list[dict[str, Any]]) -> dict[str, float]:
@@ -800,6 +826,7 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
     lean_logger = LeanMetricsLogger(ctx, enable_diagnostics=cfg.enable_diagnostics)
     debug_reporter = DebugReporter(
         ctx,
+        enable_diagnostics=cfg.enable_diagnostics,
         debug_mode=cfg.debug_mode,
         save_per_sample_report=cfg.save_per_sample_report,
         save_plots=cfg.save_plots,
@@ -825,11 +852,14 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
     t_train = time.perf_counter()
     proto_model.fit(train_ds, extractor)
     train_time = time.perf_counter() - t_train
+    train_backbone = float(proto_model.fit_timing.get("time_backbone_forward_train", 0.0))
+    train_transform_t = float(proto_model.fit_timing.get("time_transform_update_train", 0.0))
+    train_proto_t = float(proto_model.fit_timing.get("time_prototype_update_train", 0.0))
 
     proto_model.save(ctx.metrics_dir)
 
     t_eval = time.perf_counter()
-    metrics, per_sample_rows, per_sample_eval, image_scores, pixel_scores = evaluate(
+    metrics, per_sample_rows, per_sample_eval, image_scores, pixel_scores, eval_timing = evaluate(
         test_ds,
         extractor,
         proto_model,
@@ -874,10 +904,17 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
     pixel_f1_values = [float(r["pixel_f1"]) for r in per_defect_metrics]
 
     timing_summary = {
-        "time_feature_extraction_train": float(train_time),
-        "time_transform_fit_or_update": float(train_time),
-        "time_prototype_fit_or_update": float(train_time),
+        "time_feature_extraction_train": float(train_backbone),
+        "time_transform_fit_or_update": float(train_transform_t),
+        "time_prototype_fit_or_update": float(train_proto_t),
+        "time_backbone_forward_train": float(train_backbone),
+        "time_transform_update_train": float(train_transform_t),
+        "time_prototype_update_train": float(train_proto_t),
         "time_eval_total": float(eval_time),
+        "time_backbone_forward_eval": float(eval_timing.get("time_backbone_forward_eval", 0.0)),
+        "time_transform_eval": float(eval_timing.get("time_transform_eval", 0.0)),
+        "time_distance_eval": float(eval_timing.get("time_distance_eval", 0.0)),
+        "time_postprocess_eval": float(eval_timing.get("time_postprocess_eval", 0.0)),
         "mean_infer_time_sec": float(metrics["mean_infer_time_sec"]),
     }
 
@@ -901,19 +938,29 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
         "mean_infer_time_sec": float(metrics["mean_infer_time_sec"]),
         "total_runtime_sec": float(total_time),
         "effective_num_prototypes": int(metrics.get("effective_num_prototypes", 0)),
+        "image_score_good_mean": float(np.mean([r["image_score"] for r in per_sample_eval if r["label"] == 0])) if any(r["label"] == 0 for r in per_sample_eval) else float("nan"),
+        "image_score_good_std": float(np.std([r["image_score"] for r in per_sample_eval if r["label"] == 0])) if any(r["label"] == 0 for r in per_sample_eval) else float("nan"),
+        "image_score_defect_mean": float(np.mean([r["image_score"] for r in per_sample_eval if r["label"] == 1])) if any(r["label"] == 1 for r in per_sample_eval) else float("nan"),
+        "image_score_defect_std": float(np.std([r["image_score"] for r in per_sample_eval if r["label"] == 1])) if any(r["label"] == 1 for r in per_sample_eval) else float("nan"),
+        "patch_score_good_mean": float(np.mean(np.concatenate([r["anom_map"].ravel() for r in per_sample_eval if r["label"] == 0]))) if any(r["label"] == 0 for r in per_sample_eval) else float("nan"),
+        "patch_score_good_std": float(np.std(np.concatenate([r["anom_map"].ravel() for r in per_sample_eval if r["label"] == 0]))) if any(r["label"] == 0 for r in per_sample_eval) else float("nan"),
+        "patch_score_defect_mean": float(np.mean(np.concatenate([r["anom_map"].ravel() for r in per_sample_eval if r["label"] == 1]))) if any(r["label"] == 1 for r in per_sample_eval) else float("nan"),
+        "patch_score_defect_std": float(np.std(np.concatenate([r["anom_map"].ravel() for r in per_sample_eval if r["label"] == 1]))) if any(r["label"] == 1 for r in per_sample_eval) else float("nan"),
     }
 
     lean_logger.log_summary_metrics(summary, summary)
     lean_logger.log_timing_summary(timing_summary)
     lean_logger.log_per_defect_metrics(per_defect_metrics)
 
-    if cfg.enable_diagnostics and cfg.debug_mode:
-        debug_reporter.log_per_sample_table(per_sample_rows)
+    if cfg.enable_diagnostics:
+        if cfg.debug_mode:
+            debug_reporter.log_per_sample_table(per_sample_rows)
         if proto_model.inc_model is not None:
             pmeta = proto_model.inc_model.prototypes.meta
             status_counts = {"stable": 0, "candidate": 0, "fading": 0}
             for m in pmeta:
                 status_counts[m.status] = status_counts.get(m.status, 0) + 1
+            counts = proto_model.inc_model.prototypes.counts
             prototype_summary = {
                 "prototype_count_total": len(pmeta),
                 "prototype_count_stable": status_counts.get("stable", 0),
@@ -922,11 +969,19 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
                 "mean_distance_to_nearest_prototype": float(np.mean(image_scores)) if image_scores.size else float("nan"),
                 "mean_distance_to_second_nearest_prototype": float("nan"),
                 "prototype_usage_entropy": float("nan"),
+                "mean_cluster_size": float(np.mean(counts)) if counts is not None and counts.size else 0.0,
+                "std_cluster_size": float(np.std(counts)) if counts is not None and counts.size else 0.0,
+                "min_cluster_size": float(np.min(counts)) if counts is not None and counts.size else 0.0,
+                "max_cluster_size": float(np.max(counts)) if counts is not None and counts.size else 0.0,
+                "prototype_usage_count_mean": float(np.mean(counts)) if counts is not None and counts.size else 0.0,
+                "prototype_usage_count_std": float(np.std(counts)) if counts is not None and counts.size else 0.0,
             }
             debug_reporter.log_prototype_summary(prototype_summary)
 
             w = proto_model.inc_model.transformer.whitening
-            z = proto_model.inc_model.transformer.transform(proto_model.inc_model.replay.sample_for_update()) if proto_model.inc_model.replay.sample_for_update().size else np.empty((0, cfg.projection_dim), dtype=np.float32)
+            replay_feats = proto_model.inc_model.replay.sample_for_update()
+            z = proto_model.inc_model.transformer.transform(replay_feats) if replay_feats.size else np.empty((0, cfg.projection_dim), dtype=np.float32)
+            last_cons = proto_model.inc_model.config.get("last_consolidation_stats", {}) if isinstance(proto_model.inc_model.config, dict) else {}
             transform_summary = {
                 "feature_dim_before_transform": int(w.mean.shape[0]) if w.mean is not None else 0,
                 "feature_dim_after_transform": int(cfg.projection_dim),
@@ -935,10 +990,14 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
                 "running_mean_norm": float(np.linalg.norm(w.mean)) if w.mean is not None else 0.0,
                 "running_var_mean": float(np.mean(w.var)) if w.mean is not None else 0.0,
                 "running_var_std": float(np.std(w.var)) if w.mean is not None else 0.0,
+                "running_mean_shift_since_last_update": last_cons.get("whitening_mean_shift"),
+                "running_var_shift_since_last_update": last_cons.get("whitening_var_shift"),
             }
             debug_reporter.log_transform_summary(transform_summary)
 
             replay_comp = proto_model.inc_model.replay.composition()
+            best_prev_img = float(metrics["image_auroc"])
+            best_prev_pix = float(metrics["pixel_auroc"])
             incremental_row = {
                 "update_step": proto_model.inc_model.num_seen_images,
                 "accepted_images": proto_model.inc_model.accepted_images,
@@ -946,15 +1005,22 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
                 "replay_size": int(sum(replay_comp.values())),
                 "num_candidates": status_counts.get("candidate", 0),
                 "num_promoted": 0,
-                "current_image_auroc": float(metrics["image_auroc"]),
-                "current_pixel_auroc": float(metrics["pixel_auroc"]),
-                "forgetting_delta_image": 0.0,
-                "forgetting_delta_pixel": 0.0,
+                "num_removed_prototypes": 0,
+                "num_fading_prototypes": status_counts.get("fading", 0),
             }
             debug_reporter.log_incremental_update([incremental_row])
-            debug_reporter.log_forgetting_report([incremental_row])
+            debug_reporter.log_forgetting_report([{
+                "update_step": proto_model.inc_model.num_seen_images,
+                "current_image_auroc": float(metrics["image_auroc"]),
+                "best_previous_image_auroc": best_prev_img,
+                "forgetting_delta_image": float(max(best_prev_img - float(metrics["image_auroc"]), 0.0)),
+                "current_pixel_auroc": float(metrics["pixel_auroc"]),
+                "best_previous_pixel_auroc": best_prev_pix,
+                "forgetting_delta_pixel": float(max(best_prev_pix - float(metrics["pixel_auroc"]), 0.0)),
+            }])
 
-        debug_reporter.create_debug_plots(per_defect_metrics, image_scores, pixel_scores, timing_summary)
+        if cfg.debug_mode:
+            debug_reporter.create_debug_plots(per_defect_metrics, image_scores, pixel_scores, timing_summary)
 
     experiment_writer.append_row(
         {
