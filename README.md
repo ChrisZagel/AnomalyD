@@ -2,16 +2,19 @@
 
 ## Kurze Architekturzusammenfassung
 
-Dieser PoC implementiert eine **normal-only, patch-basierte Anomalieerkennung** auf **MVTec AD `metal_nut`**:
+Dieser Stand nutzt jetzt eine **voll inkrementelle, patch-basierte Anomalieerkennung** ohne PCA:
 
-1. **Gefrorener Backbone:** vortrainiertes timm-Backbone (konfigurierbar über `--backbone-model-name`).
-2. **Multi-Level Features:** 3 Ebenen (ViT-Intermediate oder letzte 3 `features_only`-Maps bei CNN/Hybrid-Backbones).
-3. **Feature-Fusion:** Ebenen auf gemeinsames Raster, L2-Norm, Concat.
-4. **PCA + Prototypen:** PCA-Reduktion und MiniBatchKMeans auf `train/good`.
-5. **Inference:** Distanz zu Prototypen -> Pixel-Anomaly-Map + Image-Score.
-6. **Evaluation:** Image-AUROC + Pixel-AUROC, plus Profiling-/Diagnose-Outputs.
+1. **Gefrorener Backbone** (timm, keine Gradientenupdates)
+2. **Multi-Level Feature Fusion** (wie bisher)
+3. **Running Whitening** (online Mean/Var, batch-stabil)
+4. **Fixed Random Projection** (einmal initialisiert, dann fix)
+5. **Inkrementelle Prototypen** (stable/candidate/fading)
+6. **Replay Memory** (coverage/boundary/recent)
+7. **Gated Online Updates + periodische Konsolidierung**
 
-Die Pipeline läuft auf CPU und GPU in Colab.
+Pipeline:
+
+`multi-level features -> running whitening -> fixed projection -> prototypes -> distance scoring`
 
 ---
 
@@ -24,73 +27,65 @@ Die Pipeline läuft auf CPU und GPU in Colab.
 !python main.py --backbone-model-name vit_base_patch14_dinov2.lvd142m
 ```
 
-Beispiele:
-
-```python
-!python main.py --backbone-model-name vit_small_patch14_dinov2.lvd142m
-!python main.py --backbone-model-name shvit_s4.in1k
-!python main.py --backbone-model-name edgenext_small.usi_in1k
-```
-
----
-
-## Unterstützte Backbones / Weights
-
-Folgende Namen werden explizit unterstützt:
-
-- `vit_base_patch14_dinov2.lvd142m`
-- `vit_base_patch14_reg4_dinov2.lvd142m`
-- `vit_small_patch14_dinov2.lvd142m`
-- `shvit_s4.in1k`
-- `edgenext_small.usi_in1k`
-
 ---
 
 ## Wichtige CLI-Parameter
 
-- `--backbone-model-name` (siehe Liste oben)
-- `--feature-size-factor` (z. B. `1.0`, `0.75`, `0.5`)
-- `--num-prototypes` (z. B. `256`)
-- `--pca-dim` (z. B. `128`)
-- `--distance-type` (`cosine`, `l2`, `mahalanobis_diag`)
-- `--mahalanobis-alpha`, `--mahalanobis-min-var`, `--mahalanobis-eps` (nur für `mahalanobis_diag`)
-- `--num-visualization-examples` (Default `5`)
+- `--num-prototypes` (Default `512`)
+- `--distance-type` (`l2`, `cosine`, `mahalanobis_diag`)
+- `--projection-type` (`sparse_random_projection`, `gaussian_random_projection`)
+- `--projection-dim` (Default `96`)
+- `--projection-seed` (Default `42`)
+- `--whitening-eps` (Default `1e-6`)
+
+---
+
+## Neue Kernkomponenten
+
+- `IncrementalWhiteningStats`
+- `FixedRandomProjector`
+- `IncrementalWhitenedProjection`
+- `ReplayMemoryManager`
+- `PrototypeStore`
+- `IncrementalADModel`
+
+Implementiert in `app/incremental_model.py`.
+
+---
+
+## Beispielablauf (API)
+
+```python
+from app.incremental_model import IncrementalADModel
+
+cfg = {
+    "projection_type": "sparse_random_projection",
+    "projection_dim": 96,
+    "distance_type": "l2",
+    "num_prototypes": 512,
+}
+
+model = IncrementalADModel(cfg)
+model.fit_initial(train_patch_features)  # np.ndarray [N, D]
+
+scores = model.predict(test_patch_features)
+
+model.update_incremental([img1_patch_feats, img2_patch_feats])
+model.consolidate()
+
+model.save_state("incremental_state.pkl")
+loaded = IncrementalADModel.load_state("incremental_state.pkl")
+```
 
 ---
 
 ## Outputs
 
-Nach erfolgreichem Lauf unter `/content/project/outputs/`:
+Unter `/content/project/outputs/`:
 
 - `metrics.json` / `metrics.csv`
 - `per_sample_report.csv`
-- `per_defect_metrics.csv` (Pixel-AUROC, AUPRO, Image/Pixel Precision-Recall-F1 pro Fehlertyp)
-- `models/prototype_model.pkl`
+- `per_defect_metrics.csv`
+- `models/prototype_model.pkl` (inkl. inkrementellem State)
 - `visualizations/*.png`
 - `visualizations/final_top5_overlay_gallery.png`
-
----
-
-## Hinweis
-
-ADPretrain-Checkpoint-Support wurde entfernt; der PoC arbeitet jetzt ausschließlich mit direkt verfügbaren pretrained timm-Weights über `--backbone-model-name`.
-
-## Troubleshooting
-
-- Wenn du Fehler wie `AttributeError: 'PCA' object has no attribute 'n_samples_seen_'` siehst,
-  ist meist eine ältere Version des Skripts aktiv (z. B. in verschachtelten Colab-Klonpfaden wie
-  `/content/AnomalyD/AnomalyD/...`).
-- In diesem Stand wird PCA-sample-count kompatibel über `n_samples_seen_` **oder** `n_samples_`
-  behandelt.
-- Empfohlen: Repo in Colab einmal sauber neu klonen (alte verschachtelte Ordner entfernen) und
-  danach erneut ausführen.
-
-
-## Stabilität bei kleiner Feature-Map
-
-Wenn ein Backbone eine sehr grobe Feature-Map liefert (z. B. wenige Patch-Features pro Bild), wird die effektive Anzahl der Prototypen automatisch auf die verfügbare Anzahl reduzierter Trainings-Patches begrenzt. Dadurch wird der Fehler `n_samples < n_clusters` vermieden.
-
-
-## Mahalanobis (diag) Distanz
-
-Bei `--distance-type mahalanobis_diag` werden nach PCA+KMeans pro Prototyp diagonale Varianzen aus den PCA-Trainingsfeatures geschätzt (mit globaler Varianz-Regularisierung und Mindestvarianz-Clipping). Die zusätzlichen Statistikparameter werden mit dem Modell gespeichert.
