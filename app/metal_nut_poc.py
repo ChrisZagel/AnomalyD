@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import random
 import shutil
@@ -232,6 +233,8 @@ class FeatureExtractor:
         )
         self._ov_compiled = None
         self._ov_input_name: str | None = None
+        self._ov_output_ports: list[Any] = []
+        self.openvino_active_in_eval: bool = False
 
     def _select_maps(self, maps: list[torch.Tensor], layer_mode: str) -> list[torch.Tensor]:
         if layer_mode == "single_last_layer":
@@ -282,6 +285,42 @@ class FeatureExtractor:
         model = core.read_model(str(onnx_path))
         self._ov_compiled = core.compile_model(model, "CPU")
         self._ov_input_name = model.inputs[0].get_any_name()
+        self._ov_output_ports = list(self._ov_compiled.outputs)
+
+    @staticmethod
+    def _ov_tensor_to_numpy(tensor: Any) -> np.ndarray:
+        if isinstance(tensor, np.ndarray):
+            return tensor
+
+        data = getattr(tensor, "data", None)
+        if data is not None:
+            try:
+                return np.array(data)
+            except Exception:
+                try:
+                    return np.array(data[:])
+                except Exception:
+                    pass
+
+        return np.array(tensor)
+
+    def _collect_openvino_outputs(self, outputs: Any) -> list[np.ndarray]:
+        ordered_tensors: list[Any] = []
+
+        if isinstance(outputs, dict):
+            if self._ov_output_ports:
+                missing_ports = [port for port in self._ov_output_ports if port not in outputs]
+                if missing_ports:
+                    raise RuntimeError("OpenVINO output dict is missing expected output ports.")
+                ordered_tensors = [outputs[port] for port in self._ov_output_ports]
+            else:
+                raise RuntimeError("OpenVINO output order is not initialized.")
+        elif isinstance(outputs, (list, tuple)):
+            ordered_tensors = list(outputs)
+        else:
+            raise RuntimeError(f"Unsupported OpenVINO output type: {type(outputs).__name__}")
+
+        return [self._ov_tensor_to_numpy(tensor) for tensor in ordered_tensors]
 
     @torch.no_grad()
     def extract_patch_features(
@@ -310,11 +349,9 @@ class FeatureExtractor:
                 self._ensure_openvino(tuple(tensor.shape))
                 assert self._ov_compiled is not None and self._ov_input_name is not None
                 outputs = self._ov_compiled({self._ov_input_name: tensor.detach().cpu().numpy()})
-                if isinstance(outputs, dict):
-                    ordered_keys = sorted(outputs.keys(), key=lambda k: str(k))
-                    maps = [torch.from_numpy(outputs[k]).to(self.device) for k in ordered_keys]
-                else:
-                    maps = [torch.from_numpy(o).to(self.device) for o in outputs]
+                ov_maps = self._collect_openvino_outputs(outputs)
+                maps = [torch.from_numpy(ov_map).to(self.device) for ov_map in ov_maps]
+                self.openvino_active_in_eval = True
             except Exception as exc:
                 warnings.warn(
                     f"OpenVINO backend unavailable ({exc}). Falling back to pytorch backend for this run.",
@@ -519,17 +556,46 @@ class PrototypeAnomalyModel:
             "candidate_distance_threshold": self.cfg.candidate_distance_threshold,
         }
 
-    def fit(self, dataset: MVTecMetalNutDataset, extractor: FeatureExtractor) -> None:
-        train_feats = []
-        t_backbone = 0.0
-        for sample in tqdm(dataset.samples, desc="Collect features for incremental model"):
-            image = Image.open(sample).convert("RGB")
-            t0 = time.perf_counter()
-            feats, _, _ = extractor.extract_patch_features(image)
-            t_backbone += float(time.perf_counter() - t0)
-            train_feats.append(feats.astype(np.float32))
+    def _build_train_feature_cache_path(self, dataset: MVTecMetalNutDataset) -> Path:
+        train_basenames = [p.name for p in dataset.samples]
+        key_payload = {
+            "backbone_model_name": self.cfg.backbone_model_name,
+            "feature_size_factor": self.cfg.feature_size_factor,
+            "feature_layer_mode": self.cfg.feature_layer_mode,
+            "dataset_path": str(dataset.root.resolve()),
+            "train_image_count": len(train_basenames),
+            "train_image_basenames": train_basenames,
+        }
+        key_json = json.dumps(key_payload, sort_keys=True, ensure_ascii=False)
+        key_hash = hashlib.sha256(key_json.encode("utf-8")).hexdigest()[:16]
+        return Path(self.cfg.project_root) / "outputs" / "cache" / f"train_feats_{key_hash}.npz"
 
-        all_feats = np.concatenate(train_feats, axis=0)
+    def fit(self, dataset: MVTecMetalNutDataset, extractor: FeatureExtractor) -> None:
+        cache_path = self._build_train_feature_cache_path(dataset)
+        all_feats: np.ndarray | None = None
+        t_backbone = 0.0
+
+        if not self.cfg.disable_feature_cache and cache_path.exists():
+            cache_payload = np.load(cache_path)
+            all_feats = cache_payload["all_feats"].astype(np.float32)
+            print(f"Loaded cached train features: {cache_path}")
+
+        if all_feats is None:
+            train_feats = []
+            for sample in tqdm(dataset.samples, desc="Collect features for incremental model"):
+                image = Image.open(sample).convert("RGB")
+                t0 = time.perf_counter()
+                feats, _, _ = extractor.extract_patch_features(image)
+                t_backbone += float(time.perf_counter() - t0)
+                train_feats.append(feats.astype(np.float32))
+
+            all_feats = np.concatenate(train_feats, axis=0)
+
+            if not self.cfg.disable_feature_cache:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(cache_path, all_feats=all_feats)
+                print(f"Saved train feature cache: {cache_path}")
+
         if all_feats.shape[0] > self.cfg.max_pca_samples:
             idx = np.random.choice(all_feats.shape[0], self.cfg.max_pca_samples, replace=False)
             all_feats = all_feats[idx]
@@ -853,6 +919,7 @@ def evaluate(
     num_visualization_examples: int,
     debug_mode: bool,
 ) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]], np.ndarray, np.ndarray, dict[str, float]]:
+    extractor.openvino_active_in_eval = False
     image_labels: list[int] = []
     image_scores: list[float] = []
     pixel_labels: list[np.ndarray] = []
@@ -1338,6 +1405,7 @@ def run_poc(cfg: PoCConfig) -> dict[str, float]:
         "mean_infer_time_sec": float(metrics["mean_infer_time_sec"]),
         "num_eval_passes_executed": int(num_eval_passes_executed),
         "inference_backend": cfg.inference_backend,
+        "openvino_active_in_eval": bool(extractor.openvino_active_in_eval),
     }
 
     summary = {
